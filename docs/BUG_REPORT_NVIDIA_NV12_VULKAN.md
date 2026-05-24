@@ -1,30 +1,40 @@
-# NVIDIA driver bug: `vkCreateImage` rejects NV12 dma-buf with the modifier NVIDIA's own GBM produced
+# NVIDIA Vulkan: `VkImageDrmFormatModifierExplicitCreateInfoEXT` rejects NV12 layouts that the parallel list-based path accepts
 
 `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`, NVIDIA 595.71.05,
-both proprietary and open driver branches, X11 and headless.
+proprietary userspace + open or proprietary kernel modules, X11.
 
 ## Summary
 
-NVIDIA's userspace stack is internally inconsistent for NV12 dma-buf
-import:
+NVIDIA's Vulkan implementation accepts NV12 dma-buf imports via the
+**list-based** path (`VkImageDrmFormatModifierListCreateInfoEXT` —
+"buffer is one of these modifiers, you pick") used by libplacebo /
+mpv / Wayland compositors, but **rejects the same buffer via the
+explicit-layout path** (`VkImageDrmFormatModifierExplicitCreateInfoEXT` —
+"buffer is exactly this modifier with this plane layout") used by
+Chromium/ANGLE.
 
-- NVIDIA's GBM allocates an NV12 buffer with modifier `0x300000000606014`
-  (a block-linear 2D variant) when given the implicit modifier.
-- NVIDIA's EGL imports that buffer back via
-  `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, …)` cleanly — both with the
-  modifier passed explicitly and without.
-- NVIDIA's Vulkan **rejects** the same buffer at `vkCreateImage` with
-  `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` from the
-  `VK_EXT_image_drm_format_modifier` validation, even though the
-  modifier is advertised as supported via the EGL query interface and
-  the Vulkan extensions are all present.
+Concretely:
 
-This is the actual driver-side cause of "GPU process crashes /
-hardware video decode disabled" for Chromium with
-`--use-angle=vulkan` on NVIDIA + X11. The Chromium failure surfaces
-as `DmaBufImageSiblingVkLinux.cpp:initImpl:616 VK_ERROR_FEATURE_NOT_PRESENT`,
-but the underlying problem is that ANGLE's `vkCreateImage` call is
-hitting this driver bug.
+| Caller | Path | Result |
+| --- | --- | --- |
+| NVIDIA's GBM | `gbm_bo_create(NV12)` | ok, picks modifier `0x300000000606014` (block-linear) |
+| NVIDIA's EGL | `eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` on that fd | ok (both with and without modifier in attribs) |
+| libplacebo | `VkImageDrmFormatModifierListCreateInfoEXT` on that fd | ok — smooth NV12 playback in mpv via VAAPI |
+| **This probe / ANGLE** | **`VkImageDrmFormatModifierExplicitCreateInfoEXT`** | **`VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`** |
+
+So NVIDIA's Vulkan can in fact import these buffers — only the
+strict, explicit-layout entrypoint is broken. The result is that any
+Vulkan client using `VkImageDrmFormatModifierExplicitCreateInfoEXT`
+(notably ANGLE's `DmaBufImageSiblingVkLinux.cpp`) cannot use
+hardware video decode on NVIDIA X11.
+
+This is the driver-side cause of the Chromium failure
+`DmaBufImageSiblingVkLinux.cpp:initImpl:616 VK_ERROR_FEATURE_NOT_PRESENT`
+seen when running with `--use-angle=vulkan`. The error bubbles up
+through ANGLE as `FEATURE_NOT_PRESENT`, but the underlying
+`vkCreateImage` returns `INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`
+for the layout our probe (and ANGLE) construct from the GBM bo's
+plane offsets and pitches.
 
 ## Reproducer
 
@@ -152,17 +162,50 @@ characterizing it cleanly:
 - <https://forums.developer.nvidia.com/t/status-of-linux-dma-buf-support/209404>
 - <https://github.com/NixOS/nixpkgs/issues/209101>
 
+## Cross-check: libplacebo works on the same buffer
+
+Confirming the buffer itself is valid — mpv with VAAPI decode +
+Vulkan output plays the same content cleanly:
+
+```
+mpv --vo=gpu --gpu-api=vulkan --hwdec=vaapi /tmp/bbb-vp9.webm
+  → "[vo/gpu/vaapi] using libplacebo dmabuf interop"
+  → "Decoder format: 1920x1080 vaapi[nv12] bt.709 ..."
+  → smooth playback, no errors
+```
+
+Same NV12 frames from NVIDIA's VAAPI (NVDEC under
+nvidia-vaapi-driver) imported into a Vulkan VkImage and rendered —
+which is exactly the producer/consumer pair Chromium uses. libplacebo
+uses `VkImageDrmFormatModifierListCreateInfoEXT` for the import; we
+suspect this is why it works while ANGLE's explicit-layout path
+fails.
+
+Separately, `mpv --gpu-api=vulkan --hwdec=auto` (which picks
+Vulkan-native video decode `vp9-vulkan` via `VK_KHR_video_decode_vp9`)
+plays but renders visibly garbled output ("bowl of jello") — likely
+a different NVIDIA Vulkan bug, in the video-decode side rather than
+the dma-buf interop side. Mentioning for context; not the focus of
+this report.
+
 ## Asks
 
-Any one of these resolves the user-visible symptom:
+In rough order of "most general fix" to "most pragmatic":
 
-1. Make `vkCreateImage` accept the modifier+layout combination that
-   NVIDIA's GBM produces — the EGL path proves the buffer is valid.
-2. If the modifier+layout combo legitimately is invalid for Vulkan,
-   have NVIDIA's GBM not pick it for NV12 in the first place.
-3. Document precisely which `(format, modifier, plane layout)`
-   tuples are accepted by `VK_EXT_image_drm_format_modifier` so
-   userspace can constrain its requests up front.
+1. Make `VkImageDrmFormatModifierExplicitCreateInfoEXT` accept the
+   modifier+layout combination NVIDIA's GBM produces for NV12. The
+   list-based path already accepts buffers with this layout, and
+   `eglCreateImage` accepts them too — so the buffer is verifiably
+   valid; the rejection appears to be in this entrypoint's
+   validation specifically.
+2. Document precisely which `(format, modifier, plane-layout)`
+   tuples `VK_EXT_image_drm_format_modifier`'s explicit path accepts
+   on NVIDIA, so callers know whether to fall back to the list path.
+3. Update NVIDIA's Vulkan implementation notes to recommend the
+   list-based path over the explicit path for dma-buf imports, so
+   that ANGLE / other clients can be patched to use what works.
 
 (Re-running the probe against an updated driver is one command —
-happy to bisect a fix or verify.)
+happy to bisect a fix or verify a candidate. The probe's source is
+~700 lines of MIT Rust and is structured so adding new format/modifier
+test cases is a one-line change.)
