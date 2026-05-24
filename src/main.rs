@@ -11,6 +11,7 @@
 mod egl_ffi;
 mod probe;
 mod report;
+mod vulkan_import;
 
 use std::path::PathBuf;
 
@@ -41,6 +42,11 @@ struct Args {
     /// Skip the format × modifier matrix; only print extension info.
     #[arg(long)]
     extensions_only: bool,
+
+    /// Skip the Vulkan dma-buf import probe (useful if libvulkan is
+    /// unavailable or the GPU has no Vulkan support).
+    #[arg(long)]
+    skip_vulkan: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,9 +61,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let probe = probe::Probe::new(&args.device)?;
 
+    let vulkan_probe = if args.skip_vulkan {
+        None
+    } else {
+        match vulkan_import::VulkanProbe::new() {
+            Ok(vp) => Some(vp),
+            Err(e) => {
+                eprintln!(
+                    "{} {}",
+                    "Vulkan probe init failed:".yellow(),
+                    e
+                );
+                eprintln!(
+                    "{}",
+                    "  Continuing with EGL-only probe. Pass --skip-vulkan to silence.".dimmed()
+                );
+                None
+            }
+        }
+    };
+
     report::print_device_info(&probe);
     report::print_extension_summary(&probe);
     report::print_driver_claims(&probe);
+    if let Some(vp) = &vulkan_probe {
+        report::print_vulkan_info(vp);
+    }
 
     if args.extensions_only {
         return Ok(());
@@ -73,7 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         formats.len() * modifiers.len()
     );
 
-    let results = probe.run_matrix(&formats, &modifiers, args.verbose);
+    let results = probe.run_matrix_with_vulkan(
+        &formats,
+        &modifiers,
+        vulkan_probe.as_ref(),
+        args.verbose,
+    );
     report::print_matrix(&results, &formats, &modifiers);
     report::print_summary(&results);
 

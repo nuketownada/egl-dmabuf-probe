@@ -7,6 +7,7 @@ use tabled::{
 };
 
 use crate::probe::{AllocResult, ImportResult, MatrixCell, ModifierSpec, FormatSpec, Probe};
+use crate::vulkan_import::{VulkanImportResult, VulkanProbe};
 
 /// Keys we highlight in the EGL extension dumps.
 const RELEVANT_EXTENSIONS: &[(&str, &str)] = &[
@@ -116,6 +117,29 @@ pub fn print_driver_claims(p: &Probe) {
     }
 }
 
+pub fn print_vulkan_info(vp: &VulkanProbe) {
+    println!("\n{}", "Vulkan probe".bold().underline());
+    println!("  Device:         {}", vp.device_name.cyan());
+    println!("  API version:    {}", vp.api_version);
+    println!("  Driver version: {}", vp.driver_version);
+    if vp.missing_extensions.is_empty() {
+        println!(
+            "  Required extensions: {}",
+            "all present".green()
+        );
+    } else {
+        println!(
+            "  {} Missing required extensions: {}",
+            "✗".red(),
+            vp.missing_extensions.join(", ").red()
+        );
+        println!(
+            "{}",
+            "  → Vulkan import attempts will be marked 'skipped' below.".dimmed()
+        );
+    }
+}
+
 pub fn print_extension_summary(p: &Probe) {
     println!("\n{}", "EGL Extensions".bold().underline());
 
@@ -151,12 +175,16 @@ struct Row {
     #[tabled(rename = "GBM alloc")]
     alloc: String,
     /// EGL import using the modifier the caller asked for (none for INVALID rows).
-    #[tabled(rename = "Import (as req)")]
+    #[tabled(rename = "EGL (as req)")]
     import_req: String,
     /// EGL import using the driver-chosen modifier (only for INVALID rows
     /// that allocated with a concrete modifier).
-    #[tabled(rename = "Import (w/ actual mod)")]
+    #[tabled(rename = "EGL (w/ mod)")]
     import_actual: String,
+    /// Vulkan dma-buf import via VK_EXT_external_memory_dma_buf +
+    /// VK_EXT_image_drm_format_modifier (what ANGLE-on-Vulkan does).
+    #[tabled(rename = "Vulkan")]
+    vulkan: String,
     #[tabled(rename = "Notes")]
     notes: String,
 }
@@ -183,15 +211,17 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 None => "—".dimmed().to_string(),
                 Some(r) => fmt_import(r),
             };
-            // Notes priority: alloc failure first, then whichever
-            // import attempt failed most informatively.
-            let notes = match (&c.alloc, &c.import_as_requested, &c.import_with_actual_modifier) {
+            let vulkan = match &c.vulkan_import {
+                None => "—".dimmed().to_string(),
+                Some(v) => fmt_vk_import(v),
+            };
+            // Notes priority: alloc failure → vulkan failure → EGL failure.
+            // The vulkan path is the one most likely to surface
+            // chromium-relevant error codes, so we surface it first.
+            let notes = match (&c.alloc, &c.vulkan_import, &c.import_as_requested) {
                 (AllocResult::Failed(e), _, _) => truncate(e, 50),
-                (_, _, Some(ImportResult::Failed(e))) if matches!(&c.import_as_requested, ImportResult::Failed(_)) => {
-                    // Both failed — the actual-modifier one usually has the more interesting error.
-                    truncate(e, 50)
-                }
-                (_, ImportResult::Failed(e), _) => truncate(e, 50),
+                (_, Some(VulkanImportResult::Failed(e)), _) => truncate(e, 50),
+                (_, _, ImportResult::Failed(e)) => truncate(e, 50),
                 _ => String::new(),
             };
             Row {
@@ -200,6 +230,7 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 alloc,
                 import_req,
                 import_actual,
+                vulkan,
                 notes,
             }
         })
@@ -208,7 +239,7 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Modify::new(Columns::single(5)).with(Width::wrap(50).keep_words(true)));
+        .with(Modify::new(Columns::single(6)).with(Width::wrap(50).keep_words(true)));
     println!("\n{}", "DMA-BUF format × modifier matrix".bold().underline());
     println!("{table}");
     println!(
@@ -223,6 +254,14 @@ fn fmt_import(r: &ImportResult) -> String {
         ImportResult::Ok => "ok".green().to_string(),
         ImportResult::Failed(_) => "fail".red().to_string(),
         ImportResult::Skipped => "—".dimmed().to_string(),
+    }
+}
+
+fn fmt_vk_import(r: &VulkanImportResult) -> String {
+    match r {
+        VulkanImportResult::Ok => "ok".green().to_string(),
+        VulkanImportResult::Failed(_) => "fail".red().to_string(),
+        VulkanImportResult::Skipped(_) => "skip".dimmed().to_string(),
     }
 }
 
@@ -280,6 +319,47 @@ pub fn print_summary(cells: &[MatrixCell]) {
             println!(
                 "{}",
                 "  → Likely fix for chromium: pass modifier on every import, even for INVALID alloc.".dimmed()
+            );
+        }
+    }
+
+    let vk_attempted = cells
+        .iter()
+        .filter(|c| matches!(&c.vulkan_import, Some(VulkanImportResult::Ok | VulkanImportResult::Failed(_))))
+        .count();
+    let vk_ok = cells
+        .iter()
+        .filter(|c| matches!(&c.vulkan_import, Some(VulkanImportResult::Ok)))
+        .count();
+    if vk_attempted > 0 {
+        println!(
+            "  Vulkan dma-buf imports:     {} of {} attempted ({}%)",
+            vk_ok.green(),
+            vk_attempted,
+            pct(vk_ok, vk_attempted)
+        );
+        let egl_ok_vk_fail = cells
+            .iter()
+            .filter(|c| {
+                let egl_ok = matches!(c.import_as_requested, ImportResult::Ok)
+                    || matches!(c.import_with_actual_modifier, Some(ImportResult::Ok));
+                let vk_fail = matches!(&c.vulkan_import, Some(VulkanImportResult::Failed(_)));
+                egl_ok && vk_fail
+            })
+            .count();
+        if egl_ok_vk_fail > 0 {
+            println!(
+                "  {} {} combinations succeed via EGL but fail via Vulkan",
+                "★".yellow().bold(),
+                egl_ok_vk_fail.red()
+            );
+            println!(
+                "{}",
+                "  → Confirms the chromium-with-ANGLE-Vulkan failure is real,".dimmed()
+            );
+            println!(
+                "{}",
+                "    distinct from the EGL path, and not in user code.".dimmed()
             );
         }
     }

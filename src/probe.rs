@@ -12,6 +12,7 @@ use drm_fourcc::DrmFourcc;
 use gbm::{AsRaw, BufferObjectFlags, Device as GbmDevice, Format as GbmFormat, Modifier};
 
 use crate::egl_ffi::*;
+use crate::vulkan_import::{VulkanImportResult, VulkanProbe};
 
 pub struct Probe {
     pub device_path: String,
@@ -92,10 +93,20 @@ impl Probe {
         modifiers: &[ModifierSpec],
         verbose: bool,
     ) -> Vec<MatrixCell> {
+        self.run_matrix_with_vulkan(formats, modifiers, None, verbose)
+    }
+
+    pub fn run_matrix_with_vulkan(
+        &self,
+        formats: &[FormatSpec],
+        modifiers: &[ModifierSpec],
+        vulkan: Option<&VulkanProbe>,
+        verbose: bool,
+    ) -> Vec<MatrixCell> {
         let mut results = Vec::with_capacity(formats.len() * modifiers.len());
         for f in formats {
             for m in modifiers {
-                results.push(self.probe_one(f, m, verbose));
+                results.push(self.probe_one(f, m, vulkan, verbose));
             }
         }
         results
@@ -184,7 +195,13 @@ impl Probe {
             .collect())
     }
 
-    fn probe_one(&self, f: &FormatSpec, m: &ModifierSpec, verbose: bool) -> MatrixCell {
+    fn probe_one(
+        &self,
+        f: &FormatSpec,
+        m: &ModifierSpec,
+        vulkan: Option<&VulkanProbe>,
+        verbose: bool,
+    ) -> MatrixCell {
         const W: u32 = 256;
         const H: u32 = 256;
 
@@ -197,6 +214,7 @@ impl Probe {
                     alloc: AllocResult::Unsupported,
                     import_as_requested: ImportResult::Skipped,
                     import_with_actual_modifier: None,
+                    vulkan_import: None,
                 };
             }
         };
@@ -226,6 +244,7 @@ impl Probe {
                     alloc: AllocResult::Failed(e.to_string()),
                     import_as_requested: ImportResult::Skipped,
                     import_with_actual_modifier: None,
+                    vulkan_import: None,
                 };
             }
         };
@@ -256,12 +275,18 @@ impl Probe {
             None
         };
 
+        // Vulkan import attempt with the same bo. ANGLE-on-Vulkan +
+        // chromium uses this exact code path (VK_EXT_external_memory_dma_buf
+        // + VK_EXT_image_drm_format_modifier).
+        let vulkan_import = vulkan.map(|vp| vp.try_import(&bo, f, W, H, verbose));
+
         MatrixCell {
             format: f.clone(),
             modifier: m.clone(),
             alloc: AllocResult::Ok { actual_modifier },
             import_as_requested,
             import_with_actual_modifier,
+            vulkan_import,
         }
     }
 
@@ -461,6 +486,9 @@ pub struct MatrixCell {
     /// modifier in the import attribs even when it picked it during
     /// allocation.
     pub import_with_actual_modifier: Option<ImportResult>,
+    /// Vulkan dma-buf import attempt for the bo (None when the
+    /// `VulkanProbe` was disabled or wasn't passed in).
+    pub vulkan_import: Option<VulkanImportResult>,
 }
 
 #[derive(Debug)]

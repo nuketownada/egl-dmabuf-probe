@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/nuketownada/egl-dmabuf-probe"
 
 [dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
 clap = { version = "4", features = ["derive"] }
 gbm = "0.18"
 drm-fourcc = "2"

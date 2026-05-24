@@ -18,14 +18,16 @@
           libgbm          # provides libgbm.so (was mesa-libgbm in older nixpkgs)
           libdrm
           libglvnd        # libEGL.so dispatch
+          vulkan-loader   # libvulkan.so.1 dispatch (ash loads dynamically)
+          vulkan-headers  # headers + validation
           # wayland is a transitive build dep of the `drm` / `gbm`
           # crates' bindings (wayland-sys). We don't use wayland at
           # runtime, but pkg-config needs to find wayland-server.pc at
           # build time.
           wayland
-          # At runtime on NVIDIA systems, libEGL.so.1 is loaded from
-          # /run/opengl-driver/lib via dlopen — see the LD_LIBRARY_PATH
-          # in shellHook below.
+          # At runtime on NVIDIA systems, libEGL.so.1 / libGLX.so.0 /
+          # libvulkan.so.1 are loaded from /run/opengl-driver/lib via
+          # dlopen — see the LD_LIBRARY_PATH in shellHook below.
         ];
 
         nativeBuildDeps = with pkgs; [
@@ -83,9 +85,13 @@
           # paths must be visible. Mesa libgbm from /run/opengl-driver
           # is what we want at runtime (matches kernel driver).
           shellHook = ''
-            export LD_LIBRARY_PATH="${pkgs.libglvnd}/lib:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export LD_LIBRARY_PATH="${pkgs.libglvnd}/lib:${pkgs.vulkan-loader}/lib:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # Tell vulkan-loader where to find vendor ICDs. NixOS exposes
+            # the active driver's ICD manifest in /run/opengl-driver.
+            export VK_ICD_FILENAMES="/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.x86_64.json"
             echo "egl-dmabuf-probe dev shell."
-            echo "  LD_LIBRARY_PATH includes libglvnd dispatch + /run/opengl-driver/lib"
+            echo "  LD_LIBRARY_PATH includes libglvnd + vulkan-loader + /run/opengl-driver/lib"
+            echo "  VK_ICD_FILENAMES points at NVIDIA's ICD manifest"
             echo "  cargo build --release  →  ./target/release/egl-dmabuf-probe"
             echo "  cargo run -- -d /dev/dri/renderD129"
           '';
