@@ -34,8 +34,11 @@ back to software video decode, surfacing as
 `DmaBufImageSiblingVkLinux.cpp:initImpl:616 VK_ERROR_FEATURE_NOT_PRESENT`
 in chrome logs. Underlying `vkCreateImage` returns
 `INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`. There is no
-workaround because the latest stable Chromium has dropped support
-for the GLX path.
+workaround: the latest stable Chromium dropped the GLX backend, and
+the default ANGLE-on-EGL path also fails because NVIDIA's EGL does
+not expose `EGL_KHR_image_pixmap` (which Chromium's ozone-x11 backend
+uses to wrap X11 pixmaps). The Vulkan path documented here is
+therefore the only remaining option, and it's broken by this bug.
 
 ## Reproducer
 
