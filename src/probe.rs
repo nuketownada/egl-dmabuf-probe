@@ -112,7 +112,8 @@ impl Probe {
                     format: f.clone(),
                     modifier: m.clone(),
                     alloc: AllocResult::Unsupported,
-                    import: ImportResult::Skipped,
+                    import_as_requested: ImportResult::Skipped,
+                    import_with_actual_modifier: None,
                 };
             }
         };
@@ -140,7 +141,8 @@ impl Probe {
                     format: f.clone(),
                     modifier: m.clone(),
                     alloc: AllocResult::Failed(e.to_string()),
-                    import: ImportResult::Skipped,
+                    import_as_requested: ImportResult::Skipped,
+                    import_with_actual_modifier: None,
                 };
             }
         };
@@ -148,26 +150,76 @@ impl Probe {
         let actual_modifier: u64 = u64::from(bo.modifier());
         let stride: u32 = bo.stride();
         let offset: u32 = bo.offset(0);
+
+        // First import attempt: use whatever modifier the caller
+        // requested (none for INVALID, explicit for others).
+        let modifier_for_first_attempt = if m.value == DRM_FORMAT_MOD_INVALID {
+            None
+        } else {
+            Some(m.value)
+        };
+        let import_as_requested =
+            self.try_import(&bo, f, modifier_for_first_attempt, W, H, stride, offset, verbose);
+
+        // Second import attempt: only for INVALID-modifier rows where
+        // the driver returned a concrete non-INVALID modifier. Retry
+        // with that modifier passed explicitly to EGL. Tells us
+        // whether NVIDIA's EGL requires the modifier to be specified
+        // even though it picked it itself.
+        let import_with_actual_modifier = if m.value == DRM_FORMAT_MOD_INVALID
+            && actual_modifier != DRM_FORMAT_MOD_INVALID
+            && actual_modifier != DRM_FORMAT_MOD_LINEAR
+        {
+            Some(self.try_import(
+                &bo,
+                f,
+                Some(actual_modifier),
+                W,
+                H,
+                stride,
+                offset,
+                verbose,
+            ))
+        } else {
+            None
+        };
+
+        MatrixCell {
+            format: f.clone(),
+            modifier: m.clone(),
+            alloc: AllocResult::Ok { actual_modifier },
+            import_as_requested,
+            import_with_actual_modifier,
+        }
+    }
+
+    /// Attempt one `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)`. The
+    /// dmabuf fd is exported fresh from the bo each call (EGL dups it
+    /// on success, but explicit closing keeps the accounting clean).
+    fn try_import<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        format: &FormatSpec,
+        modifier: Option<u64>,
+        width: u32,
+        height: u32,
+        stride: u32,
+        offset: u32,
+        verbose: bool,
+    ) -> ImportResult {
         let fd = match bo.fd_for_plane(0) {
             Ok(fd) => fd,
-            Err(e) => {
-                return MatrixCell {
-                    format: f.clone(),
-                    modifier: m.clone(),
-                    alloc: AllocResult::Ok { actual_modifier },
-                    import: ImportResult::Failed(format!("gbm_bo_get_fd: {e}")),
-                };
-            }
+            Err(e) => return ImportResult::Failed(format!("gbm_bo_get_fd: {e}")),
         };
         let fd_raw = fd.into_raw_fd();
 
         let mut attribs: Vec<EGLint> = vec![
             EGL_WIDTH,
-            W as EGLint,
+            width as EGLint,
             EGL_HEIGHT,
-            H as EGLint,
+            height as EGLint,
             EGL_LINUX_DRM_FOURCC_EXT,
-            f.fourcc as EGLint,
+            format.fourcc as EGLint,
             EGL_DMA_BUF_PLANE0_FD_EXT,
             fd_raw,
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -175,53 +227,43 @@ impl Probe {
             EGL_DMA_BUF_PLANE0_PITCH_EXT,
             stride as EGLint,
         ];
-        if m.value != DRM_FORMAT_MOD_INVALID {
+        if let Some(mod_val) = modifier {
             attribs.push(EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT);
-            attribs.push((m.value & 0xFFFF_FFFF) as EGLint);
+            attribs.push((mod_val & 0xFFFF_FFFF) as EGLint);
             attribs.push(EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT);
-            attribs.push(((m.value >> 32) & 0xFFFF_FFFF) as EGLint);
+            attribs.push(((mod_val >> 32) & 0xFFFF_FFFF) as EGLint);
         }
         attribs.push(EGL_NONE);
 
         let image = unsafe {
             (self.egl.create_image_khr)(
                 self.display,
-                std::ptr::null_mut(), // EGL_NO_CONTEXT
+                std::ptr::null_mut(),
                 EGL_LINUX_DMA_BUF_EXT,
                 std::ptr::null_mut(),
                 attribs.as_ptr(),
             )
         };
+        unsafe { libc::close(fd_raw) };
 
-        // EGL dup's the fd on success; we always close ours.
-        unsafe {
-            libc::close(fd_raw);
-        }
-
-        let import = if image.is_null() {
+        if image.is_null() {
             let code = self.egl.last_error();
             if verbose {
+                let mod_repr = modifier
+                    .map(|m| format!("0x{:x}", m))
+                    .unwrap_or_else(|| "(no modifier)".to_string());
                 eprintln!(
-                    "import {} / {} failed: {} ({})",
-                    f.name,
-                    m.name,
+                    "import {} {} failed: {} ({})",
+                    format.name,
+                    mod_repr,
                     code,
                     egl_error_str(code)
                 );
             }
             ImportResult::Failed(format!("{} ({})", code, egl_error_str(code)))
         } else {
-            unsafe {
-                (self.egl.destroy_image_khr)(self.display, image);
-            }
+            unsafe { (self.egl.destroy_image_khr)(self.display, image) };
             ImportResult::Ok
-        };
-
-        MatrixCell {
-            format: f.clone(),
-            modifier: m.clone(),
-            alloc: AllocResult::Ok { actual_modifier },
-            import,
         }
     }
 }
@@ -301,7 +343,18 @@ pub struct MatrixCell {
     pub format: FormatSpec,
     pub modifier: ModifierSpec,
     pub alloc: AllocResult,
-    pub import: ImportResult,
+    /// Import attempt using the modifier the caller asked for. For
+    /// INVALID-modifier rows that means no modifier was passed in
+    /// the EGL attribs; for explicit-modifier rows it means that
+    /// modifier was passed.
+    pub import_as_requested: ImportResult,
+    /// Only populated for INVALID-modifier rows that successfully
+    /// allocated with a concrete non-INVALID modifier: a second
+    /// import attempt that passes that driver-chosen modifier
+    /// explicitly. Lets us see whether NVIDIA's EGL requires the
+    /// modifier in the import attribs even when it picked it during
+    /// allocation.
+    pub import_with_actual_modifier: Option<ImportResult>,
 }
 
 #[derive(Debug)]

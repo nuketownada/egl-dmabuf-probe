@@ -64,8 +64,13 @@ struct Row {
     modifier: String,
     #[tabled(rename = "GBM alloc")]
     alloc: String,
-    #[tabled(rename = "EGL import")]
-    import: String,
+    /// EGL import using the modifier the caller asked for (none for INVALID rows).
+    #[tabled(rename = "Import (as req)")]
+    import_req: String,
+    /// EGL import using the driver-chosen modifier (only for INVALID rows
+    /// that allocated with a concrete modifier).
+    #[tabled(rename = "Import (w/ actual mod)")]
+    import_actual: String,
     #[tabled(rename = "Notes")]
     notes: String,
 }
@@ -87,21 +92,28 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 AllocResult::Failed(_) => "fail".red().to_string(),
                 AllocResult::Unsupported => "n/a".dimmed().to_string(),
             };
-            let import = match &c.import {
-                ImportResult::Ok => "ok".green().to_string(),
-                ImportResult::Failed(_) => "fail".red().to_string(),
-                ImportResult::Skipped => "—".dimmed().to_string(),
+            let import_req = fmt_import(&c.import_as_requested);
+            let import_actual = match &c.import_with_actual_modifier {
+                None => "—".dimmed().to_string(),
+                Some(r) => fmt_import(r),
             };
-            let notes = match (&c.alloc, &c.import) {
-                (AllocResult::Failed(e), _) => truncate(e, 60),
-                (_, ImportResult::Failed(e)) => truncate(e, 60),
+            // Notes priority: alloc failure first, then whichever
+            // import attempt failed most informatively.
+            let notes = match (&c.alloc, &c.import_as_requested, &c.import_with_actual_modifier) {
+                (AllocResult::Failed(e), _, _) => truncate(e, 50),
+                (_, _, Some(ImportResult::Failed(e))) if matches!(&c.import_as_requested, ImportResult::Failed(_)) => {
+                    // Both failed — the actual-modifier one usually has the more interesting error.
+                    truncate(e, 50)
+                }
+                (_, ImportResult::Failed(e), _) => truncate(e, 50),
                 _ => String::new(),
             };
             Row {
                 format: c.format.name.to_string(),
                 modifier: c.modifier.name.to_string(),
                 alloc,
-                import,
+                import_req,
+                import_actual,
                 notes,
             }
         })
@@ -110,9 +122,22 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Modify::new(Columns::single(4)).with(Width::wrap(60).keep_words(true)));
+        .with(Modify::new(Columns::single(5)).with(Width::wrap(50).keep_words(true)));
     println!("\n{}", "DMA-BUF format × modifier matrix".bold().underline());
     println!("{table}");
+    println!(
+        "{}",
+        "  \"Import (w/ actual mod)\" = INVALID-modifier alloc, then retry with driver-chosen modifier"
+            .dimmed()
+    );
+}
+
+fn fmt_import(r: &ImportResult) -> String {
+    match r {
+        ImportResult::Ok => "ok".green().to_string(),
+        ImportResult::Failed(_) => "fail".red().to_string(),
+        ImportResult::Skipped => "—".dimmed().to_string(),
+    }
 }
 
 pub fn print_summary(cells: &[MatrixCell]) {
@@ -121,36 +146,56 @@ pub fn print_summary(cells: &[MatrixCell]) {
         .iter()
         .filter(|c| matches!(c.alloc, AllocResult::Ok { .. }))
         .count();
-    let import_ok = cells
+    let import_req_ok = cells
         .iter()
-        .filter(|c| matches!(c.import, ImportResult::Ok))
+        .filter(|c| matches!(c.import_as_requested, ImportResult::Ok))
+        .count();
+    let retried = cells
+        .iter()
+        .filter(|c| c.import_with_actual_modifier.is_some())
+        .count();
+    let import_actual_ok = cells
+        .iter()
+        .filter(|c| matches!(c.import_with_actual_modifier, Some(ImportResult::Ok)))
+        .count();
+    let recovered_by_actual = cells
+        .iter()
+        .filter(|c| {
+            matches!(c.import_as_requested, ImportResult::Failed(_))
+                && matches!(c.import_with_actual_modifier, Some(ImportResult::Ok))
+        })
         .count();
 
     println!("\n{}", "Summary".bold().underline());
+    println!("  Combinations tested:        {}", total);
     println!(
-        "  Combinations tested:  {}",
-        total
-    );
-    println!(
-        "  Allocations succeeded: {} ({}%)",
+        "  GBM allocations succeeded:  {} ({}%)",
         alloc_ok.green(),
         pct(alloc_ok, total)
     );
     println!(
-        "  Imports succeeded:     {} ({}%)",
-        import_ok.green(),
-        pct(import_ok, total)
+        "  EGL imports (as requested): {} ({}%)",
+        import_req_ok.green(),
+        pct(import_req_ok, total)
     );
-
-    let import_fail = total - import_ok - cells
-        .iter()
-        .filter(|c| matches!(c.import, ImportResult::Skipped))
-        .count();
-    if import_fail > 0 {
+    if retried > 0 {
         println!(
-            "  Imports failed:        {}",
-            import_fail.red()
+            "  EGL imports (w/ actual mod): {} of {} retried ({}% of retries)",
+            import_actual_ok.green(),
+            retried,
+            pct(import_actual_ok, retried)
         );
+        if recovered_by_actual > 0 {
+            println!(
+                "  {} Recovered by passing the driver's chosen modifier explicitly: {}",
+                "★".yellow().bold(),
+                recovered_by_actual.green()
+            );
+            println!(
+                "{}",
+                "  → Likely fix for chromium: pass modifier on every import, even for INVALID alloc.".dimmed()
+            );
+        }
     }
 }
 
