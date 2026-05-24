@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     report::print_device_info(&probe);
     report::print_extension_summary(&probe);
+    report::print_driver_claims(&probe);
 
     if args.extensions_only {
         return Ok(());

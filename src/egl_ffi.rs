@@ -36,8 +36,64 @@ pub const EGL_HEIGHT: EGLint = 0x3056;
 pub const EGL_DMA_BUF_PLANE0_FD_EXT: EGLint = 0x3272;
 pub const EGL_DMA_BUF_PLANE0_OFFSET_EXT: EGLint = 0x3273;
 pub const EGL_DMA_BUF_PLANE0_PITCH_EXT: EGLint = 0x3274;
+
+pub const EGL_DMA_BUF_PLANE1_FD_EXT: EGLint = 0x3275;
+pub const EGL_DMA_BUF_PLANE1_OFFSET_EXT: EGLint = 0x3276;
+pub const EGL_DMA_BUF_PLANE1_PITCH_EXT: EGLint = 0x3277;
+
+pub const EGL_DMA_BUF_PLANE2_FD_EXT: EGLint = 0x3278;
+pub const EGL_DMA_BUF_PLANE2_OFFSET_EXT: EGLint = 0x3279;
+pub const EGL_DMA_BUF_PLANE2_PITCH_EXT: EGLint = 0x327A;
+
+pub const EGL_DMA_BUF_PLANE3_FD_EXT: EGLint = 0x3440;
+pub const EGL_DMA_BUF_PLANE3_OFFSET_EXT: EGLint = 0x3441;
+pub const EGL_DMA_BUF_PLANE3_PITCH_EXT: EGLint = 0x3442;
+
 pub const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: EGLint = 0x3443;
 pub const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: EGLint = 0x3444;
+pub const EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT: EGLint = 0x3445;
+pub const EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT: EGLint = 0x3446;
+pub const EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT: EGLint = 0x3447;
+pub const EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT: EGLint = 0x3448;
+pub const EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT: EGLint = 0x3449;
+pub const EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT: EGLint = 0x344A;
+
+/// Per-plane EGL attrib indices. `attrib_for(plane, AttribKind::Fd)`
+/// returns e.g. `EGL_DMA_BUF_PLANE2_FD_EXT`.
+pub fn plane_attrib(plane: u32, kind: PlaneAttrib) -> EGLint {
+    use PlaneAttrib::*;
+    match (plane, kind) {
+        (0, Fd) => EGL_DMA_BUF_PLANE0_FD_EXT,
+        (0, Offset) => EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        (0, Pitch) => EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        (0, ModLo) => EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+        (0, ModHi) => EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+        (1, Fd) => EGL_DMA_BUF_PLANE1_FD_EXT,
+        (1, Offset) => EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+        (1, Pitch) => EGL_DMA_BUF_PLANE1_PITCH_EXT,
+        (1, ModLo) => EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+        (1, ModHi) => EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+        (2, Fd) => EGL_DMA_BUF_PLANE2_FD_EXT,
+        (2, Offset) => EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+        (2, Pitch) => EGL_DMA_BUF_PLANE2_PITCH_EXT,
+        (2, ModLo) => EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+        (2, ModHi) => EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
+        (3, Fd) => EGL_DMA_BUF_PLANE3_FD_EXT,
+        (3, Offset) => EGL_DMA_BUF_PLANE3_OFFSET_EXT,
+        (3, Pitch) => EGL_DMA_BUF_PLANE3_PITCH_EXT,
+        (3, ModLo) => EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
+        (3, ModHi) => EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT,
+        _ => unreachable!("EGL_EXT_image_dma_buf_import supports at most 4 planes"),
+    }
+}
+
+pub enum PlaneAttrib {
+    Fd,
+    Offset,
+    Pitch,
+    ModLo,
+    ModHi,
+}
 
 // Errors
 pub const EGL_SUCCESS: EGLint = 0x3000;

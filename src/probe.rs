@@ -101,6 +101,89 @@ impl Probe {
         results
     }
 
+    /// Call `eglQueryDmaBufFormatsEXT` to enumerate the formats the
+    /// driver claims to accept for dma-buf import.
+    pub fn query_supported_formats(&self) -> Result<Vec<EGLint>, String> {
+        let f = self
+            .egl
+            .query_dma_buf_formats
+            .ok_or("eglQueryDmaBufFormatsEXT not available")?;
+        let mut count: EGLint = 0;
+        let ok = unsafe { f(self.display, 0, std::ptr::null_mut(), &mut count) };
+        if ok != EGL_TRUE {
+            return Err(format!(
+                "query formats (count): {}",
+                egl_error_str(self.egl.last_error())
+            ));
+        }
+        let mut formats = vec![0; count as usize];
+        let mut actual: EGLint = 0;
+        let ok = unsafe { f(self.display, count, formats.as_mut_ptr(), &mut actual) };
+        if ok != EGL_TRUE {
+            return Err(format!(
+                "query formats: {}",
+                egl_error_str(self.egl.last_error())
+            ));
+        }
+        formats.truncate(actual as usize);
+        Ok(formats)
+    }
+
+    /// Call `eglQueryDmaBufModifiersEXT` to enumerate the modifiers the
+    /// driver claims to accept for a given format. Returns (modifier,
+    /// external_only) pairs.
+    pub fn query_supported_modifiers(
+        &self,
+        format: EGLint,
+    ) -> Result<Vec<(u64, bool)>, String> {
+        let f = self
+            .egl
+            .query_dma_buf_modifiers
+            .ok_or("eglQueryDmaBufModifiersEXT not available")?;
+        let mut count: EGLint = 0;
+        let ok = unsafe {
+            f(
+                self.display,
+                format,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+        };
+        if ok != EGL_TRUE {
+            return Err(format!(
+                "query modifiers (count): {}",
+                egl_error_str(self.egl.last_error())
+            ));
+        }
+        let mut mods = vec![0u64; count as usize];
+        let mut externals = vec![0u32; count as usize];
+        let mut actual: EGLint = 0;
+        let ok = unsafe {
+            f(
+                self.display,
+                format,
+                count,
+                mods.as_mut_ptr(),
+                externals.as_mut_ptr(),
+                &mut actual,
+            )
+        };
+        if ok != EGL_TRUE {
+            return Err(format!(
+                "query modifiers: {}",
+                egl_error_str(self.egl.last_error())
+            ));
+        }
+        mods.truncate(actual as usize);
+        externals.truncate(actual as usize);
+        Ok(mods
+            .into_iter()
+            .zip(externals.into_iter().map(|e| e == EGL_TRUE))
+            .collect())
+    }
+
     fn probe_one(&self, f: &FormatSpec, m: &ModifierSpec, verbose: bool) -> MatrixCell {
         const W: u32 = 256;
         const H: u32 = 256;
@@ -148,8 +231,6 @@ impl Probe {
         };
 
         let actual_modifier: u64 = u64::from(bo.modifier());
-        let stride: u32 = bo.stride();
-        let offset: u32 = bo.offset(0);
 
         // First import attempt: use whatever modifier the caller
         // requested (none for INVALID, explicit for others).
@@ -159,7 +240,7 @@ impl Probe {
             Some(m.value)
         };
         let import_as_requested =
-            self.try_import(&bo, f, modifier_for_first_attempt, W, H, stride, offset, verbose);
+            self.try_import(&bo, f, modifier_for_first_attempt, W, H, verbose);
 
         // Second import attempt: only for INVALID-modifier rows where
         // the driver returned a concrete non-INVALID modifier. Retry
@@ -170,16 +251,7 @@ impl Probe {
             && actual_modifier != DRM_FORMAT_MOD_INVALID
             && actual_modifier != DRM_FORMAT_MOD_LINEAR
         {
-            Some(self.try_import(
-                &bo,
-                f,
-                Some(actual_modifier),
-                W,
-                H,
-                stride,
-                offset,
-                verbose,
-            ))
+            Some(self.try_import(&bo, f, Some(actual_modifier), W, H, verbose))
         } else {
             None
         };
@@ -193,9 +265,12 @@ impl Probe {
         }
     }
 
-    /// Attempt one `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)`. The
-    /// dmabuf fd is exported fresh from the bo each call (EGL dups it
-    /// on success, but explicit closing keeps the accounting clean).
+    /// Attempt one `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)`.
+    /// Fills attribs for every plane the bo has, not just plane 0 —
+    /// multi-plane formats like NV12/P010/YV12 require all planes to
+    /// be described or EGL returns EGL_BAD_PARAMETER. Each dmabuf fd
+    /// is exported fresh from the bo; EGL dups on success, we close
+    /// either way.
     fn try_import<U>(
         &self,
         bo: &gbm::BufferObject<U>,
@@ -203,15 +278,35 @@ impl Probe {
         modifier: Option<u64>,
         width: u32,
         height: u32,
-        stride: u32,
-        offset: u32,
         verbose: bool,
     ) -> ImportResult {
-        let fd = match bo.fd_for_plane(0) {
-            Ok(fd) => fd,
-            Err(e) => return ImportResult::Failed(format!("gbm_bo_get_fd: {e}")),
-        };
-        let fd_raw = fd.into_raw_fd();
+        let plane_count = bo.plane_count();
+        if plane_count > 4 {
+            return ImportResult::Failed(format!(
+                "bo has {} planes, EGL_EXT_image_dma_buf_import supports at most 4",
+                plane_count
+            ));
+        }
+
+        // Export an fd for every plane first; if any fails, bail.
+        let mut planes: Vec<(i32, u32, u32)> = Vec::with_capacity(plane_count as usize);
+        for i in 0..plane_count {
+            let fd = match bo.fd_for_plane(i as i32) {
+                Ok(fd) => fd.into_raw_fd(),
+                Err(e) => {
+                    // Close any fds we already exported.
+                    for (fd, _, _) in &planes {
+                        unsafe { libc::close(*fd) };
+                    }
+                    return ImportResult::Failed(format!(
+                        "gbm_bo_get_fd(plane {i}): {e}"
+                    ));
+                }
+            };
+            let stride = bo.stride_for_plane(i as i32);
+            let offset = bo.offset(i as i32);
+            planes.push((fd, stride, offset));
+        }
 
         let mut attribs: Vec<EGLint> = vec![
             EGL_WIDTH,
@@ -220,18 +315,25 @@ impl Probe {
             height as EGLint,
             EGL_LINUX_DRM_FOURCC_EXT,
             format.fourcc as EGLint,
-            EGL_DMA_BUF_PLANE0_FD_EXT,
-            fd_raw,
-            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-            offset as EGLint,
-            EGL_DMA_BUF_PLANE0_PITCH_EXT,
-            stride as EGLint,
         ];
-        if let Some(mod_val) = modifier {
-            attribs.push(EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT);
-            attribs.push((mod_val & 0xFFFF_FFFF) as EGLint);
-            attribs.push(EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT);
-            attribs.push(((mod_val >> 32) & 0xFFFF_FFFF) as EGLint);
+        for (i, (fd, stride, offset)) in planes.iter().enumerate() {
+            let p = i as u32;
+            attribs.extend_from_slice(&[
+                plane_attrib(p, PlaneAttrib::Fd),
+                *fd,
+                plane_attrib(p, PlaneAttrib::Offset),
+                *offset as EGLint,
+                plane_attrib(p, PlaneAttrib::Pitch),
+                *stride as EGLint,
+            ]);
+            if let Some(mod_val) = modifier {
+                attribs.extend_from_slice(&[
+                    plane_attrib(p, PlaneAttrib::ModLo),
+                    (mod_val & 0xFFFF_FFFF) as EGLint,
+                    plane_attrib(p, PlaneAttrib::ModHi),
+                    ((mod_val >> 32) & 0xFFFF_FFFF) as EGLint,
+                ]);
+            }
         }
         attribs.push(EGL_NONE);
 
@@ -244,7 +346,10 @@ impl Probe {
                 attribs.as_ptr(),
             )
         };
-        unsafe { libc::close(fd_raw) };
+        // Always close our fds; EGL dups on success.
+        for (fd, _, _) in &planes {
+            unsafe { libc::close(*fd) };
+        }
 
         if image.is_null() {
             let code = self.egl.last_error();
@@ -253,9 +358,10 @@ impl Probe {
                     .map(|m| format!("0x{:x}", m))
                     .unwrap_or_else(|| "(no modifier)".to_string());
                 eprintln!(
-                    "import {} {} failed: {} ({})",
+                    "import {} mod={} planes={} failed: {} ({})",
                     format.name,
                     mod_repr,
+                    plane_count,
                     code,
                     egl_error_str(code)
                 );

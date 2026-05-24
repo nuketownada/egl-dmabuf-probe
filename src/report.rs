@@ -30,6 +30,92 @@ pub fn print_device_info(p: &Probe) {
     println!("  Driver: {}", p.driver_name.cyan());
 }
 
+/// Show what the driver *claims* to support via
+/// `eglQueryDmaBufFormatsEXT` / `eglQueryDmaBufModifiersEXT`. The
+/// probe matrix then verifies whether the claims hold.
+pub fn print_driver_claims(p: &Probe) {
+    println!("\n{}", "Driver-claimed dma-buf support".bold().underline());
+    let formats = match p.query_supported_formats() {
+        Ok(f) => f,
+        Err(e) => {
+            println!("  {} {}", "✗".red(), format!("eglQueryDmaBufFormatsEXT: {e}").red());
+            return;
+        }
+    };
+    if formats.is_empty() {
+        println!("  {} driver claims zero supported formats", "✗".red());
+        return;
+    }
+    println!(
+        "  Driver advertises {} importable formats via eglQueryDmaBufFormatsEXT.",
+        formats.len().to_string().bold()
+    );
+
+    // Highlight the ones we care about for browser / video pipelines.
+    let interesting = [
+        ("ARGB8888", drm_fourcc::DrmFourcc::Argb8888 as i32),
+        ("XRGB8888", drm_fourcc::DrmFourcc::Xrgb8888 as i32),
+        ("ABGR8888", drm_fourcc::DrmFourcc::Abgr8888 as i32),
+        ("XBGR8888", drm_fourcc::DrmFourcc::Xbgr8888 as i32),
+        ("NV12",     drm_fourcc::DrmFourcc::Nv12 as i32),
+        ("P010",     drm_fourcc::DrmFourcc::P010 as i32),
+        ("YUYV",     drm_fourcc::DrmFourcc::Yuyv as i32),
+        // YV12 fourcc: 'Y','V','1','2' = 0x32315659
+        ("YV12",     0x32315659),
+    ];
+    println!("  {}", "Browser / video pipeline formats:".dimmed());
+    for (name, fourcc) in interesting {
+        let present = formats.contains(&fourcc);
+        let marker = if present { "✓".green().to_string() } else { "✗".red().to_string() };
+        let name_styled = if present { name.green().to_string() } else { name.red().to_string() };
+        if present {
+            // Query modifiers for this format.
+            match p.query_supported_modifiers(fourcc) {
+                Ok(mods) if !mods.is_empty() => {
+                    let mods_str = mods
+                        .iter()
+                        .take(6)
+                        .map(|(m, ext)| {
+                            if *m == 0 {
+                                "LINEAR".to_string()
+                            } else if *m == (1u64 << 56) - 1 {
+                                "INVALID".to_string()
+                            } else {
+                                let suffix = if *ext { " [ext-only]" } else { "" };
+                                format!("0x{:x}{}", m, suffix)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let trailing = if mods.len() > 6 { format!(" (+{} more)", mods.len() - 6) } else { String::new() };
+                    println!(
+                        "    {} {:10} modifiers: {}{}",
+                        marker, name_styled, mods_str.dimmed(), trailing.dimmed()
+                    );
+                }
+                Ok(_) => {
+                    println!(
+                        "    {} {:10} {}",
+                        marker,
+                        name_styled,
+                        "format advertised but no modifiers".yellow()
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "    {} {:10} modifier query failed: {}",
+                        marker,
+                        name_styled,
+                        e.red()
+                    );
+                }
+            }
+        } else {
+            println!("    {} {} {}", marker, name_styled, "not advertised".dimmed());
+        }
+    }
+}
+
 pub fn print_extension_summary(p: &Probe) {
     println!("\n{}", "EGL Extensions".bold().underline());
 

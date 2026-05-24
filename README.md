@@ -30,17 +30,36 @@ on your driver, these don't."**
 
 1. **EGL extension presence.** Lists everything the driver advertises,
    flags the ones relevant to Chromium / compositor pixmap sharing.
-2. **`EGL_KHR_image_pixmap` test.** Allocates an X11 pixmap, attempts
-   `eglCreateImage(EGL_NATIVE_PIXMAP_KHR, ...)`, reports the result.
-   On NVIDIA this should fail because the extension isn't even
-   exposed.
+2. **Driver-claimed dma-buf support.** Calls `eglQueryDmaBufFormatsEXT`
+   and `eglQueryDmaBufModifiersEXT` to enumerate the formats and
+   modifiers the driver *claims* to support. The probe matrix then
+   verifies whether those claims hold up under real allocation + import.
 3. **DMA-BUF format × modifier matrix.** For each common format
    (ARGB8888, NV12, P010, etc.) and modifier (linear, implicit, vendor),
-   tries to allocate a GBM buffer and import it as an EGL image via
-   `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)`. Reports allocation
-   success and import success independently — so you can distinguish
-   "the driver can't allocate this" from "the driver allocated it but
-   can't import it back".
+   tries to allocate a GBM buffer and import it via
+   `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)`. **Fills attribs for
+   every plane the bo has** — multi-plane formats like NV12/P010 require
+   all planes to be described, or EGL returns EGL_BAD_PARAMETER. Reports
+   allocation and import outcomes independently.
+4. **Modifier-on-import retry.** For INVALID-modifier rows that
+   allocate with a concrete modifier, retries the import passing that
+   driver-chosen modifier explicitly. Tells you whether the driver
+   requires the modifier in import attribs.
+
+## Findings so far (NVIDIA 595 / RTX 4000 Ada, X11)
+
+- `EGL_KHR_image_pixmap` is **not exposed** at all — this is the
+  extension Chromium's ozone-x11 backend uses to wrap X11 pixmaps for
+  the compositor, and is the actual root cause of "VP9 dropped frames
+  on YouTube" on NVIDIA + Chromium 148.
+- `EGL_EXT_image_dma_buf_import` **works correctly** for both RGB
+  formats and NV12 (multi-plane) when the caller fills all plane
+  attribs per the spec. NVIDIA's dma-buf import is not the blocker.
+- The driver claims to support P010 and YUYV but `gbm_bo_create`
+  refuses to allocate them — so the claim is partly aspirational.
+- Implication: a Chromium fix would convert its X11 pixmap path to
+  use DRI3 → dma-buf → `EGL_LINUX_DMA_BUF_EXT` rather than rely on
+  `EGL_KHR_image_pixmap`. The dma-buf path works on NVIDIA.
 
 ## Usage
 
