@@ -81,6 +81,10 @@ Implications:
   driver-side (or worked around in ANGLE by avoiding the modifier
   combination NVIDIA's GBM picked).
 
+The NV12 Vulkan finding is filed with NVIDIA at
+<https://forums.developer.nvidia.com/t/nvidia-vulkan-vkimagedrmformatmodifierexplicitcreateinfoext-rejects-nv12-layouts-that-the-list-based-path-accepts/371199>.
+The full bug report is in [docs/BUG_REPORT_NVIDIA_NV12_VULKAN.md](docs/BUG_REPORT_NVIDIA_NV12_VULKAN.md).
+
 ## Usage
 
 ```bash

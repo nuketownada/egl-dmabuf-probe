@@ -2,6 +2,8 @@
 
 `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`, NVIDIA 595.71.05.
 
+**Filed at:** <https://forums.developer.nvidia.com/t/nvidia-vulkan-vkimagedrmformatmodifierexplicitcreateinfoext-rejects-nv12-layouts-that-the-list-based-path-accepts/371199>
+
 ## Symptom
 
 Same NV12 dma-buf, allocated by NVIDIA's own GBM, fed into Vulkan via
