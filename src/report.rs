@@ -181,10 +181,14 @@ struct Row {
     /// that allocated with a concrete modifier).
     #[tabled(rename = "EGL (w/ mod)")]
     import_actual: String,
-    /// Vulkan dma-buf import via VK_EXT_external_memory_dma_buf +
-    /// VK_EXT_image_drm_format_modifier (what ANGLE-on-Vulkan does).
-    #[tabled(rename = "Vulkan")]
-    vulkan: String,
+    /// Vulkan import via VkImageDrmFormatModifierExplicitCreateInfoEXT
+    /// (ANGLE / Chromium path).
+    #[tabled(rename = "VK (explicit)")]
+    vulkan_explicit: String,
+    /// Vulkan import via VkImageDrmFormatModifierListCreateInfoEXT
+    /// (libplacebo / mpv path).
+    #[tabled(rename = "VK (list)")]
+    vulkan_list: String,
     #[tabled(rename = "Notes")]
     notes: String,
 }
@@ -211,17 +215,27 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 None => "—".dimmed().to_string(),
                 Some(r) => fmt_import(r),
             };
-            let vulkan = match &c.vulkan_import {
+            let vulkan_explicit = match &c.vulkan_import_explicit {
                 None => "—".dimmed().to_string(),
                 Some(v) => fmt_vk_import(v),
             };
-            // Notes priority: alloc failure → vulkan failure → EGL failure.
-            // The vulkan path is the one most likely to surface
-            // chromium-relevant error codes, so we surface it first.
-            let notes = match (&c.alloc, &c.vulkan_import, &c.import_as_requested) {
-                (AllocResult::Failed(e), _, _) => truncate(e, 50),
-                (_, Some(VulkanImportResult::Failed(e)), _) => truncate(e, 50),
-                (_, _, ImportResult::Failed(e)) => truncate(e, 50),
+            let vulkan_list = match &c.vulkan_import_list {
+                None => "—".dimmed().to_string(),
+                Some(v) => fmt_vk_import(v),
+            };
+            // Notes priority: alloc failure → explicit Vulkan failure
+            // (the chromium-relevant one) → EGL failure → list Vulkan
+            // failure (rare; would be a different driver issue).
+            let notes = match (
+                &c.alloc,
+                &c.vulkan_import_explicit,
+                &c.import_as_requested,
+                &c.vulkan_import_list,
+            ) {
+                (AllocResult::Failed(e), _, _, _) => truncate(e, 50),
+                (_, Some(VulkanImportResult::Failed(e)), _, _) => truncate(e, 50),
+                (_, _, ImportResult::Failed(e), _) => truncate(e, 50),
+                (_, _, _, Some(VulkanImportResult::Failed(e))) => truncate(e, 50),
                 _ => String::new(),
             };
             Row {
@@ -230,7 +244,8 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 alloc,
                 import_req,
                 import_actual,
-                vulkan,
+                vulkan_explicit,
+                vulkan_list,
                 notes,
             }
         })
@@ -239,7 +254,7 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Modify::new(Columns::single(6)).with(Width::wrap(50).keep_words(true)));
+        .with(Modify::new(Columns::single(7)).with(Width::wrap(50).keep_words(true)));
     println!("\n{}", "DMA-BUF format × modifier matrix".bold().underline());
     println!("{table}");
     println!(
@@ -323,43 +338,68 @@ pub fn print_summary(cells: &[MatrixCell]) {
         }
     }
 
-    let vk_attempted = cells
+    let vk_exp_attempted = cells
         .iter()
-        .filter(|c| matches!(&c.vulkan_import, Some(VulkanImportResult::Ok | VulkanImportResult::Failed(_))))
+        .filter(|c| matches!(&c.vulkan_import_explicit, Some(VulkanImportResult::Ok | VulkanImportResult::Failed(_))))
         .count();
-    let vk_ok = cells
+    let vk_exp_ok = cells
         .iter()
-        .filter(|c| matches!(&c.vulkan_import, Some(VulkanImportResult::Ok)))
+        .filter(|c| matches!(&c.vulkan_import_explicit, Some(VulkanImportResult::Ok)))
         .count();
-    if vk_attempted > 0 {
+    let vk_list_attempted = cells
+        .iter()
+        .filter(|c| matches!(&c.vulkan_import_list, Some(VulkanImportResult::Ok | VulkanImportResult::Failed(_))))
+        .count();
+    let vk_list_ok = cells
+        .iter()
+        .filter(|c| matches!(&c.vulkan_import_list, Some(VulkanImportResult::Ok)))
+        .count();
+
+    if vk_exp_attempted > 0 || vk_list_attempted > 0 {
         println!(
-            "  Vulkan dma-buf imports:     {} of {} attempted ({}%)",
-            vk_ok.green(),
-            vk_attempted,
-            pct(vk_ok, vk_attempted)
+            "  Vulkan import (explicit):   {} of {} attempted ({}%)",
+            vk_exp_ok.green(),
+            vk_exp_attempted,
+            pct(vk_exp_ok, vk_exp_attempted)
         );
-        let egl_ok_vk_fail = cells
+        println!(
+            "  Vulkan import (list):       {} of {} attempted ({}%)",
+            vk_list_ok.green(),
+            vk_list_attempted,
+            pct(vk_list_ok, vk_list_attempted)
+        );
+
+        // The most diagnostically interesting case: explicit path
+        // fails but list path succeeds on the same buffer. Confirms
+        // the chromium / ANGLE failure is recoverable by switching
+        // strategies — and identifies the driver-side bug as being
+        // in the explicit path validation specifically.
+        let exp_fail_list_ok = cells
             .iter()
             .filter(|c| {
-                let egl_ok = matches!(c.import_as_requested, ImportResult::Ok)
-                    || matches!(c.import_with_actual_modifier, Some(ImportResult::Ok));
-                let vk_fail = matches!(&c.vulkan_import, Some(VulkanImportResult::Failed(_)));
-                egl_ok && vk_fail
+                let exp_fail = matches!(&c.vulkan_import_explicit, Some(VulkanImportResult::Failed(_)));
+                let list_ok = matches!(&c.vulkan_import_list, Some(VulkanImportResult::Ok));
+                exp_fail && list_ok
             })
             .count();
-        if egl_ok_vk_fail > 0 {
+        if exp_fail_list_ok > 0 {
+            println!();
             println!(
-                "  {} {} combinations succeed via EGL but fail via Vulkan",
+                "  {} {} buffers: explicit-layout import FAILS, list-based import SUCCEEDS",
                 "★".yellow().bold(),
-                egl_ok_vk_fail.red()
+                exp_fail_list_ok.to_string().red().bold()
             );
             println!(
                 "{}",
-                "  → Confirms the chromium-with-ANGLE-Vulkan failure is real,".dimmed()
+                "  → Driver-side bug is scoped to VkImageDrmFormatModifierExplicitCreateInfoEXT.".dimmed()
             );
             println!(
                 "{}",
-                "    distinct from the EGL path, and not in user code.".dimmed()
+                "  → ANGLE / Chromium use the explicit path; libplacebo (mpv) uses the list path".dimmed()
+            );
+            println!(
+                "{}",
+                "    and works on the same buffers. Workaround: switch caller to list path.".dimmed()
             );
         }
     }

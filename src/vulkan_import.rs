@@ -41,6 +41,29 @@ pub enum VulkanImportResult {
     Skipped(String),
 }
 
+/// Which of the two `VK_EXT_image_drm_format_modifier` import patterns
+/// to exercise.
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    /// `VkImageDrmFormatModifierExplicitCreateInfoEXT` — caller
+    /// specifies the modifier AND per-plane offsets/pitches. Used by
+    /// ANGLE's `DmaBufImageSiblingVkLinux`.
+    Explicit,
+    /// `VkImageDrmFormatModifierListCreateInfoEXT` — caller passes a
+    /// list of candidate modifiers, driver picks one and computes the
+    /// layout. Used by libplacebo / mpv / Wayland compositors.
+    List,
+}
+
+impl Strategy {
+    fn label(&self) -> &'static str {
+        match self {
+            Strategy::Explicit => "explicit",
+            Strategy::List => "list",
+        }
+    }
+}
+
 const REQUIRED_DEVICE_EXTS: &[&CStr] = &[
     ash::khr::external_memory_fd::NAME,
     ash::ext::external_memory_dma_buf::NAME,
@@ -168,14 +191,43 @@ impl VulkanProbe {
         })
     }
 
-    /// Attempt to import a GBM-allocated bo as a `VkImage` via
-    /// `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`.
-    pub fn try_import<U>(
+    /// Import via the *explicit-layout* path: caller specifies the
+    /// modifier AND the plane offsets/pitches in
+    /// `VkImageDrmFormatModifierExplicitCreateInfoEXT`. This is the
+    /// path ANGLE's `DmaBufImageSiblingVkLinux` uses.
+    pub fn try_import_explicit<U>(
         &self,
         bo: &gbm::BufferObject<U>,
         format: &FormatSpec,
         width: u32,
         height: u32,
+        verbose: bool,
+    ) -> VulkanImportResult {
+        self.try_import_inner(bo, format, width, height, Strategy::Explicit, verbose)
+    }
+
+    /// Import via the *list* path: caller specifies just a list of
+    /// candidate modifiers in `VkImageDrmFormatModifierListCreateInfoEXT`
+    /// and lets the driver figure out the layout. This is the path
+    /// libplacebo (mpv, Wayland compositors) uses.
+    pub fn try_import_list<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        format: &FormatSpec,
+        width: u32,
+        height: u32,
+        verbose: bool,
+    ) -> VulkanImportResult {
+        self.try_import_inner(bo, format, width, height, Strategy::List, verbose)
+    }
+
+    fn try_import_inner<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        format: &FormatSpec,
+        width: u32,
+        height: u32,
+        strategy: Strategy,
         verbose: bool,
     ) -> VulkanImportResult {
         let state = match &self.state {
@@ -202,6 +254,8 @@ impl VulkanProbe {
         let modifier: u64 = u64::from(bo.modifier());
 
         // Per-plane subresource layouts (offsets / row pitches within the dmabuf).
+        // Only used by the Explicit strategy; in the List strategy the driver
+        // figures them out.
         let mut plane_layouts: Vec<vk::SubresourceLayout> =
             Vec::with_capacity(plane_count as usize);
         for i in 0..plane_count {
@@ -214,9 +268,6 @@ impl VulkanProbe {
             });
         }
 
-        let mut mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-            .drm_format_modifier(modifier)
-            .plane_layouts(&plane_layouts);
         let mut ext_mem_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
@@ -225,7 +276,17 @@ impl VulkanProbe {
             height,
             depth: 1,
         };
-        let image_ci = vk::ImageCreateInfo::default()
+        // Build the modifier struct for the chosen strategy. Both
+        // strategies are kept alive for the duration of the image
+        // creation call; only one is wired into the pNext chain.
+        let mut explicit_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+        let modifier_list = [modifier];
+        let mut list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+            .drm_format_modifiers(&modifier_list);
+
+        let base_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
             .extent(extent)
@@ -235,17 +296,20 @@ impl VulkanProbe {
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
             .usage(vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .push_next(&mut ext_mem_info)
-            .push_next(&mut mod_info);
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image_ci = match strategy {
+            Strategy::Explicit => base_ci.push_next(&mut ext_mem_info).push_next(&mut explicit_info),
+            Strategy::List => base_ci.push_next(&mut ext_mem_info).push_next(&mut list_info),
+        };
 
         let image = match unsafe { state.device.create_image(&image_ci, None) } {
             Ok(img) => img,
             Err(e) => {
                 if verbose {
                     eprintln!(
-                        "vk_import {} mod=0x{:x} planes={} vkCreateImage: {:?}",
-                        format.name, modifier, plane_count, e
+                        "vk_import[{}] {} mod=0x{:x} planes={} vkCreateImage: {:?}",
+                        strategy.label(), format.name, modifier, plane_count, e
                     );
                 }
                 return VulkanImportResult::Failed(format!("vkCreateImage: {:?}", e));
@@ -329,8 +393,8 @@ impl VulkanProbe {
                 }
                 if verbose {
                     eprintln!(
-                        "vk_import {} vkAllocateMemory: {:?}",
-                        format.name, e
+                        "vk_import[{}] {} vkAllocateMemory: {:?}",
+                        strategy.label(), format.name, e
                     );
                 }
                 return VulkanImportResult::Failed(format!("vkAllocateMemory: {:?}", e));

@@ -214,7 +214,8 @@ impl Probe {
                     alloc: AllocResult::Unsupported,
                     import_as_requested: ImportResult::Skipped,
                     import_with_actual_modifier: None,
-                    vulkan_import: None,
+                    vulkan_import_explicit: None,
+                    vulkan_import_list: None,
                 };
             }
         };
@@ -244,7 +245,8 @@ impl Probe {
                     alloc: AllocResult::Failed(e.to_string()),
                     import_as_requested: ImportResult::Skipped,
                     import_with_actual_modifier: None,
-                    vulkan_import: None,
+                    vulkan_import_explicit: None,
+                    vulkan_import_list: None,
                 };
             }
         };
@@ -275,10 +277,14 @@ impl Probe {
             None
         };
 
-        // Vulkan import attempt with the same bo. ANGLE-on-Vulkan +
-        // chromium uses this exact code path (VK_EXT_external_memory_dma_buf
-        // + VK_EXT_image_drm_format_modifier).
-        let vulkan_import = vulkan.map(|vp| vp.try_import(&bo, f, W, H, verbose));
+        // Vulkan import attempts — both the explicit-layout path that
+        // ANGLE uses and the list path that libplacebo uses. Running
+        // both per-bo means a single matrix row tells you whether the
+        // chromium-on-NVIDIA failure can be sidestepped by switching
+        // strategies.
+        let vulkan_import_explicit =
+            vulkan.map(|vp| vp.try_import_explicit(&bo, f, W, H, verbose));
+        let vulkan_import_list = vulkan.map(|vp| vp.try_import_list(&bo, f, W, H, verbose));
 
         MatrixCell {
             format: f.clone(),
@@ -286,7 +292,8 @@ impl Probe {
             alloc: AllocResult::Ok { actual_modifier },
             import_as_requested,
             import_with_actual_modifier,
-            vulkan_import,
+            vulkan_import_explicit,
+            vulkan_import_list,
         }
     }
 
@@ -486,9 +493,15 @@ pub struct MatrixCell {
     /// modifier in the import attribs even when it picked it during
     /// allocation.
     pub import_with_actual_modifier: Option<ImportResult>,
-    /// Vulkan dma-buf import attempt for the bo (None when the
-    /// `VulkanProbe` was disabled or wasn't passed in).
-    pub vulkan_import: Option<VulkanImportResult>,
+    /// Vulkan dma-buf import via
+    /// `VkImageDrmFormatModifierExplicitCreateInfoEXT`
+    /// (ANGLE / Chromium path). `None` when `VulkanProbe` was disabled
+    /// or alloc failed.
+    pub vulkan_import_explicit: Option<VulkanImportResult>,
+    /// Vulkan dma-buf import via
+    /// `VkImageDrmFormatModifierListCreateInfoEXT` (libplacebo / mpv
+    /// path).
+    pub vulkan_import_list: Option<VulkanImportResult>,
 }
 
 #[derive(Debug)]
