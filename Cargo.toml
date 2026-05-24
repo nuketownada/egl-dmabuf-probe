@@ -1,0 +1,20 @@
+[package]
+name = "egl-dmabuf-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Probe NVIDIA / Mesa EGL implementations for EGL_KHR_image_pixmap and EGL_EXT_image_dma_buf_import support"
+license = "MIT"
+repository = "https://github.com/nuketownada/egl-dmabuf-probe"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+gbm = "0.18"
+drm-fourcc = "2"
+libc = "0.2"
+libloading = "0.8"
+owo-colors = "4"
+tabled = "0.16"
+
+[profile.release]
+strip = true
+lto = "thin"
