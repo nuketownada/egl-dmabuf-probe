@@ -64,6 +64,29 @@ impl Strategy {
     }
 }
 
+/// How elaborate the `VkImageCreateInfo` should be — minimal vs the
+/// full chain Chromium / ANGLE constructs.
+#[derive(Clone, Copy, Debug)]
+pub enum CreateProfile {
+    /// Minimal: SAMPLED usage, no flags, no pNext other than ext mem
+    /// + modifier. What a textbook dma-buf importer does.
+    Simple,
+    /// Chromium-like: SAMPLED + TRANSFER_SRC/DST usage, MUTABLE_FORMAT
+    /// + EXTENDED_USAGE flags, and a VkImageFormatListCreateInfoKHR in
+    /// the pNext chain listing view-compatible formats. Matches what
+    /// ANGLE's DmaBufImageSiblingVkLinux::initWithFormat builds.
+    ChromiumLike,
+}
+
+impl CreateProfile {
+    fn label(&self) -> &'static str {
+        match self {
+            CreateProfile::Simple => "simple",
+            CreateProfile::ChromiumLike => "chromium-like",
+        }
+    }
+}
+
 const REQUIRED_DEVICE_EXTS: &[&CStr] = &[
     ash::khr::external_memory_fd::NAME,
     ash::ext::external_memory_dma_buf::NAME,
@@ -203,7 +226,9 @@ impl VulkanProbe {
         height: u32,
         verbose: bool,
     ) -> VulkanImportResult {
-        self.try_import_inner(bo, format, width, height, Strategy::Explicit, verbose)
+        self.try_import_inner(
+            bo, format, width, height, Strategy::Explicit, CreateProfile::Simple, verbose,
+        )
     }
 
     /// Import via the *list* path: caller specifies just a list of
@@ -218,7 +243,33 @@ impl VulkanProbe {
         height: u32,
         verbose: bool,
     ) -> VulkanImportResult {
-        self.try_import_inner(bo, format, width, height, Strategy::List, verbose)
+        self.try_import_inner(
+            bo, format, width, height, Strategy::List, CreateProfile::Simple, verbose,
+        )
+    }
+
+    /// Like `try_import_explicit` / `try_import_list` but with the
+    /// fuller `VkImageCreateInfo` chain Chromium/ANGLE constructs:
+    /// MUTABLE_FORMAT + EXTENDED_USAGE flags, multi-usage bits, and
+    /// `VkImageFormatListCreateInfoKHR` listing view-compatible
+    /// formats.
+    pub fn try_import_chromium_like<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        format: &FormatSpec,
+        width: u32,
+        height: u32,
+        strategy_label: &str,
+        verbose: bool,
+    ) -> VulkanImportResult {
+        let strategy = if strategy_label == "list" {
+            Strategy::List
+        } else {
+            Strategy::Explicit
+        };
+        self.try_import_inner(
+            bo, format, width, height, strategy, CreateProfile::ChromiumLike, verbose,
+        )
     }
 
     fn try_import_inner<U>(
@@ -228,6 +279,7 @@ impl VulkanProbe {
         width: u32,
         height: u32,
         strategy: Strategy,
+        profile: CreateProfile,
         verbose: bool,
     ) -> VulkanImportResult {
         let state = match &self.state {
@@ -286,6 +338,29 @@ impl VulkanProbe {
         let mut list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
             .drm_format_modifiers(&modifier_list);
 
+        // Adjust usage / flags / pNext chain based on profile.
+        let (usage_flags, create_flags) = match profile {
+            CreateProfile::Simple => (vk::ImageUsageFlags::SAMPLED, vk::ImageCreateFlags::empty()),
+            CreateProfile::ChromiumLike => (
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
+            ),
+        };
+
+        // For the chromium-like profile, declare a list of formats the
+        // image may be viewed as. For NV12 the per-plane views need R8
+        // (Y) and R8G8 (UV); for RGB formats the storage compatibility
+        // pair (sRGB ↔ UNORM) is what chromium typically lists.
+        let view_formats: Vec<vk::Format> = if matches!(profile, CreateProfile::ChromiumLike) {
+            chromium_like_view_formats(vk_format)
+        } else {
+            Vec::new()
+        };
+        let mut format_list_info =
+            vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+
         let base_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
@@ -294,22 +369,29 @@ impl VulkanProbe {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::SAMPLED)
+            .usage(usage_flags)
+            .flags(create_flags)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let image_ci = match strategy {
-            Strategy::Explicit => base_ci.push_next(&mut ext_mem_info).push_next(&mut explicit_info),
-            Strategy::List => base_ci.push_next(&mut ext_mem_info).push_next(&mut list_info),
+        // Build the pNext chain. Order: external memory → modifier
+        // (explicit OR list) → optional format list.
+        let mut image_ci = base_ci.push_next(&mut ext_mem_info);
+        image_ci = match strategy {
+            Strategy::Explicit => image_ci.push_next(&mut explicit_info),
+            Strategy::List => image_ci.push_next(&mut list_info),
         };
+        if matches!(profile, CreateProfile::ChromiumLike) && !view_formats.is_empty() {
+            image_ci = image_ci.push_next(&mut format_list_info);
+        }
 
         let image = match unsafe { state.device.create_image(&image_ci, None) } {
             Ok(img) => img,
             Err(e) => {
                 if verbose {
                     eprintln!(
-                        "vk_import[{}] {} mod=0x{:x} planes={} vkCreateImage: {:?}",
-                        strategy.label(), format.name, modifier, plane_count, e
+                        "vk_import[{}/{}] {} mod=0x{:x} planes={} vkCreateImage: {:?}",
+                        profile.label(), strategy.label(), format.name, modifier, plane_count, e
                     );
                 }
                 return VulkanImportResult::Failed(format!("vkCreateImage: {:?}", e));
@@ -448,6 +530,35 @@ fn pick_device(
         }
     }
     Err("no Vulkan device with a graphics queue".to_string())
+}
+
+/// View-compatible formats Chromium's image-create chain advertises
+/// for the chromium-like profile. For multi-planar YUV formats it
+/// includes the per-plane views. Returning empty means the format
+/// list shouldn't be added (the spec disallows an empty list).
+fn chromium_like_view_formats(format: vk::Format) -> Vec<vk::Format> {
+    use vk::Format;
+    match format {
+        // NV12: 2 planes — Y (R8) + UV (R8G8)
+        Format::G8_B8R8_2PLANE_420_UNORM => {
+            vec![Format::G8_B8R8_2PLANE_420_UNORM, Format::R8_UNORM, Format::R8G8_UNORM]
+        }
+        // P010: 2 planes — Y (R10X6) + UV (R10X6G10X6)
+        Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => {
+            vec![
+                Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+                Format::R10X6_UNORM_PACK16,
+                Format::R10X6G10X6_UNORM_2PACK16,
+            ]
+        }
+        // RGB 8-bit: storage-compatible pair (chromium often wants
+        // sampled-as-UNORM + UAV-as-UINT for raster).
+        Format::B8G8R8A8_UNORM => vec![Format::B8G8R8A8_UNORM, Format::B8G8R8A8_SRGB],
+        Format::R8G8B8A8_UNORM => vec![Format::R8G8B8A8_UNORM, Format::R8G8B8A8_SRGB],
+        // Everything else: no extra views — chromium would still
+        // declare the format itself in the list to enable MUTABLE.
+        f => vec![f],
+    }
 }
 
 fn drm_to_vk_format(fourcc: drm_fourcc::DrmFourcc) -> Option<vk::Format> {

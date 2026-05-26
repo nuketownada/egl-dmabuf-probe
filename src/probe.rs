@@ -216,6 +216,8 @@ impl Probe {
                     import_with_actual_modifier: None,
                     vulkan_import_explicit: None,
                     vulkan_import_list: None,
+                    vulkan_import_chromium_explicit: None,
+                    vulkan_import_chromium_list: None,
                 };
             }
         };
@@ -247,6 +249,8 @@ impl Probe {
                     import_with_actual_modifier: None,
                     vulkan_import_explicit: None,
                     vulkan_import_list: None,
+                    vulkan_import_chromium_explicit: None,
+                    vulkan_import_chromium_list: None,
                 };
             }
         };
@@ -277,14 +281,20 @@ impl Probe {
             None
         };
 
-        // Vulkan import attempts — both the explicit-layout path that
-        // ANGLE uses and the list path that libplacebo uses. Running
-        // both per-bo means a single matrix row tells you whether the
-        // chromium-on-NVIDIA failure can be sidestepped by switching
-        // strategies.
+        // Vulkan import attempts — four cells:
+        //   simple        × (explicit, list)
+        //   chromium-like × (explicit, list)
+        // The simple cells confirm whether NVIDIA can import the buffer
+        // at all; the chromium-like cells confirm whether the import
+        // survives chromium's full vkCreateImage chain (MUTABLE_FORMAT
+        // + EXTENDED_USAGE + multi-usage + FormatList).
         let vulkan_import_explicit =
             vulkan.map(|vp| vp.try_import_explicit(&bo, f, W, H, verbose));
         let vulkan_import_list = vulkan.map(|vp| vp.try_import_list(&bo, f, W, H, verbose));
+        let vulkan_import_chromium_explicit =
+            vulkan.map(|vp| vp.try_import_chromium_like(&bo, f, W, H, "explicit", verbose));
+        let vulkan_import_chromium_list =
+            vulkan.map(|vp| vp.try_import_chromium_like(&bo, f, W, H, "list", verbose));
 
         MatrixCell {
             format: f.clone(),
@@ -294,6 +304,8 @@ impl Probe {
             import_with_actual_modifier,
             vulkan_import_explicit,
             vulkan_import_list,
+            vulkan_import_chromium_explicit,
+            vulkan_import_chromium_list,
         }
     }
 
@@ -502,6 +514,12 @@ pub struct MatrixCell {
     /// `VkImageDrmFormatModifierListCreateInfoEXT` (libplacebo / mpv
     /// path).
     pub vulkan_import_list: Option<VulkanImportResult>,
+    /// Chromium-like profile: MUTABLE_FORMAT + EXTENDED_USAGE +
+    /// multi-bit usage + VkImageFormatListCreateInfoKHR. Explicit
+    /// modifier path.
+    pub vulkan_import_chromium_explicit: Option<VulkanImportResult>,
+    /// Chromium-like profile, list modifier path.
+    pub vulkan_import_chromium_list: Option<VulkanImportResult>,
 }
 
 #[derive(Debug)]

@@ -181,14 +181,20 @@ struct Row {
     /// that allocated with a concrete modifier).
     #[tabled(rename = "EGL (w/ mod)")]
     import_actual: String,
-    /// Vulkan import via VkImageDrmFormatModifierExplicitCreateInfoEXT
-    /// (ANGLE / Chromium path).
-    #[tabled(rename = "VK (explicit)")]
+    /// Vulkan (simple profile) — explicit-modifier path.
+    #[tabled(rename = "VK simple\n(exp)")]
     vulkan_explicit: String,
-    /// Vulkan import via VkImageDrmFormatModifierListCreateInfoEXT
-    /// (libplacebo / mpv path).
-    #[tabled(rename = "VK (list)")]
+    /// Vulkan (simple profile) — list-modifier path.
+    #[tabled(rename = "VK simple\n(list)")]
     vulkan_list: String,
+    /// Vulkan (chromium-like profile: MUTABLE_FORMAT + multi-usage +
+    /// FormatList) — explicit-modifier path. This is the path that
+    /// matches ANGLE's actual vkCreateImage chain.
+    #[tabled(rename = "VK chromium\n(exp)")]
+    vulkan_chromium_explicit: String,
+    /// Vulkan (chromium-like profile) — list-modifier path.
+    #[tabled(rename = "VK chromium\n(list)")]
+    vulkan_chromium_list: String,
     #[tabled(rename = "Notes")]
     notes: String,
 }
@@ -223,19 +229,29 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 None => "—".dimmed().to_string(),
                 Some(v) => fmt_vk_import(v),
             };
-            // Notes priority: alloc failure → explicit Vulkan failure
-            // (the chromium-relevant one) → EGL failure → list Vulkan
-            // failure (rare; would be a different driver issue).
+            let vulkan_chromium_explicit = match &c.vulkan_import_chromium_explicit {
+                None => "—".dimmed().to_string(),
+                Some(v) => fmt_vk_import(v),
+            };
+            let vulkan_chromium_list = match &c.vulkan_import_chromium_list {
+                None => "—".dimmed().to_string(),
+                Some(v) => fmt_vk_import(v),
+            };
+            // Notes priority: alloc failure → chromium-like failure
+            // (most relevant to the chromium bug) → simple Vulkan
+            // failure → EGL failure.
             let notes = match (
                 &c.alloc,
+                &c.vulkan_import_chromium_list,
+                &c.vulkan_import_chromium_explicit,
                 &c.vulkan_import_explicit,
                 &c.import_as_requested,
-                &c.vulkan_import_list,
             ) {
-                (AllocResult::Failed(e), _, _, _) => truncate(e, 50),
-                (_, Some(VulkanImportResult::Failed(e)), _, _) => truncate(e, 50),
-                (_, _, ImportResult::Failed(e), _) => truncate(e, 50),
-                (_, _, _, Some(VulkanImportResult::Failed(e))) => truncate(e, 50),
+                (AllocResult::Failed(e), _, _, _, _) => truncate(e, 50),
+                (_, Some(VulkanImportResult::Failed(e)), _, _, _) => truncate(e, 50),
+                (_, _, Some(VulkanImportResult::Failed(e)), _, _) => truncate(e, 50),
+                (_, _, _, Some(VulkanImportResult::Failed(e)), _) => truncate(e, 50),
+                (_, _, _, _, ImportResult::Failed(e)) => truncate(e, 50),
                 _ => String::new(),
             };
             Row {
@@ -246,6 +262,8 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 import_actual,
                 vulkan_explicit,
                 vulkan_list,
+                vulkan_chromium_explicit,
+                vulkan_chromium_list,
                 notes,
             }
         })
@@ -254,7 +272,7 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Modify::new(Columns::single(7)).with(Width::wrap(50).keep_words(true)));
+        .with(Modify::new(Columns::single(9)).with(Width::wrap(50).keep_words(true)));
     println!("\n{}", "DMA-BUF format × modifier matrix".bold().underline());
     println!("{table}");
     println!(
