@@ -12,7 +12,7 @@ use drm_fourcc::DrmFourcc;
 use gbm::{AsRaw, BufferObjectFlags, Device as GbmDevice, Format as GbmFormat, Modifier};
 
 use crate::egl_ffi::*;
-use crate::vulkan_import::{VulkanImportResult, VulkanProbe};
+use crate::vulkan_import::{VulkanImportResult, VulkanProbe, VulkanQueryResult};
 
 pub struct Probe {
     pub device_path: String,
@@ -218,6 +218,8 @@ impl Probe {
                     vulkan_import_list: None,
                     vulkan_import_chromium_explicit: None,
                     vulkan_import_chromium_list: None,
+                    vulkan_query_simple: None,
+                    vulkan_query_chromium: None,
                 };
             }
         };
@@ -251,6 +253,8 @@ impl Probe {
                     vulkan_import_list: None,
                     vulkan_import_chromium_explicit: None,
                     vulkan_import_chromium_list: None,
+                    vulkan_query_simple: None,
+                    vulkan_query_chromium: None,
                 };
             }
         };
@@ -296,6 +300,15 @@ impl Probe {
         let vulkan_import_chromium_list =
             vulkan.map(|vp| vp.try_import_chromium_like(&bo, f, W, H, "list", verbose));
 
+        // Capability query — what chromium's FindSupportedFlagsForFormat
+        // does before it ever attempts vkCreateImage. If THIS returns
+        // VK_ERROR_FEATURE_NOT_PRESENT, the real chromium bug is the
+        // query, not the create.
+        let vulkan_query_simple =
+            vulkan.map(|vp| vp.query_image_format_properties(f, actual_modifier, false, verbose));
+        let vulkan_query_chromium =
+            vulkan.map(|vp| vp.query_image_format_properties(f, actual_modifier, true, verbose));
+
         MatrixCell {
             format: f.clone(),
             modifier: m.clone(),
@@ -306,6 +319,8 @@ impl Probe {
             vulkan_import_list,
             vulkan_import_chromium_explicit,
             vulkan_import_chromium_list,
+            vulkan_query_simple,
+            vulkan_query_chromium,
         }
     }
 
@@ -520,6 +535,14 @@ pub struct MatrixCell {
     pub vulkan_import_chromium_explicit: Option<VulkanImportResult>,
     /// Chromium-like profile, list modifier path.
     pub vulkan_import_chromium_list: Option<VulkanImportResult>,
+    /// vkGetPhysicalDeviceImageFormatProperties2 query (simple
+    /// profile) — what chromium would NOT do, but a useful baseline.
+    pub vulkan_query_simple: Option<VulkanQueryResult>,
+    /// vkGetPhysicalDeviceImageFormatProperties2 query (chromium-like
+    /// profile) — what chromium's FindSupportedFlagsForFormat
+    /// actually calls. If this returns ERROR_FEATURE_NOT_PRESENT on
+    /// NVIDIA for NV12, that's the real bug.
+    pub vulkan_query_chromium: Option<VulkanQueryResult>,
 }
 
 #[derive(Debug)]

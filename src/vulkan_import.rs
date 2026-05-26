@@ -18,6 +18,7 @@ use crate::probe::FormatSpec;
 pub struct VulkanProbe {
     _entry: ash::Entry,
     instance: ash::Instance,
+    physical_device_handle: vk::PhysicalDevice,
     pub device_name: String,
     pub api_version: String,
     pub driver_version: String,
@@ -38,6 +39,25 @@ pub enum VulkanImportResult {
     Failed(String),
     /// Skipped because the DRM format has no Vulkan equivalent, or the
     /// device doesn't expose the required extensions.
+    Skipped(String),
+}
+
+/// Outcome of `vkGetPhysicalDeviceImageFormatProperties2` for a
+/// `(format, modifier)` combination. Mirrors chromium's
+/// `FindSupportedFlagsForFormat` / `IsFormatSupported` query before
+/// it ever attempts `vkCreateImage`.
+#[derive(Debug)]
+pub enum VulkanQueryResult {
+    /// Query returned VK_SUCCESS — driver supports this combination.
+    Supported,
+    /// Query returned VK_ERROR_FORMAT_NOT_SUPPORTED — driver
+    /// affirmatively rejected this combination.
+    NotSupported,
+    /// Query returned a different error (e.g.
+    /// VK_ERROR_FEATURE_NOT_PRESENT). Reports the raw code.
+    Error(String),
+    /// Skipped because no Vulkan equivalent for the format / device
+    /// extensions missing.
     Skipped(String),
 }
 
@@ -206,6 +226,7 @@ impl VulkanProbe {
         Ok(VulkanProbe {
             _entry: entry,
             instance,
+            physical_device_handle: physical_device,
             device_name,
             api_version,
             driver_version,
@@ -246,6 +267,111 @@ impl VulkanProbe {
         self.try_import_inner(
             bo, format, width, height, Strategy::List, CreateProfile::Simple, verbose,
         )
+    }
+
+    /// Replicate Chromium's `IsFormatSupported` /
+    /// `FindSupportedFlagsForFormat` query: call
+    /// `vkGetPhysicalDeviceImageFormatProperties2` with the same
+    /// pNext chain Chromium builds (ImageFormatInfo2 → FormatList →
+    /// ExternalImageFormatInfo → DrmFormatModifierInfoEXT). Reports
+    /// whether NVIDIA accepts this *capability query* for the
+    /// `(format, modifier)` pair — independent of any image
+    /// creation. If this returns VK_ERROR_FEATURE_NOT_PRESENT, the
+    /// real chromium bug is here, not in vkCreateImage.
+    pub fn query_image_format_properties(
+        &self,
+        format: &FormatSpec,
+        modifier: u64,
+        chromium_like: bool,
+        verbose: bool,
+    ) -> VulkanQueryResult {
+        let state = match &self.state {
+            Some(s) => s,
+            None => {
+                return VulkanQueryResult::Skipped(format!(
+                    "missing device extensions: {}",
+                    self.missing_extensions.join(", ")
+                ));
+            }
+        };
+
+        let vk_format = match drm_to_vk_format(format.fourcc) {
+            Some(f) => f,
+            None => {
+                return VulkanQueryResult::Skipped(format!(
+                    "no Vulkan format for {:?}",
+                    format.fourcc
+                ));
+            }
+        };
+
+        let (usage, flags) = if chromium_like {
+            (
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+                vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
+            )
+        } else {
+            (vk::ImageUsageFlags::SAMPLED, vk::ImageCreateFlags::empty())
+        };
+
+        let view_formats: Vec<vk::Format> = if chromium_like {
+            chromium_like_view_formats(vk_format)
+        } else {
+            Vec::new()
+        };
+        let mut format_list_info =
+            vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        // Build the chain: ImageFormatInfo2 → FormatList → ExternalImageFormatInfo → DrmModifierInfo.
+        // ash's push_next wires successive nodes by appending; chromium's
+        // chain order is ImageFormatInfo2 .pNext → FormatList .pNext →
+        // External .pNext → DrmModifier. push_next on the builder
+        // produces the same effective order.
+        let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(vk_format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(usage)
+            .flags(flags)
+            .push_next(&mut external_info)
+            .push_next(&mut modifier_info);
+        if chromium_like && !view_formats.is_empty() {
+            info = info.push_next(&mut format_list_info);
+        }
+
+        let mut props = vk::ImageFormatProperties2::default();
+        let result = unsafe {
+            (self.instance.fp_v1_1().get_physical_device_image_format_properties2)(
+                self.physical_device_handle,
+                &info as *const _,
+                &mut props,
+            )
+        };
+        // Reference state so the unused-let pattern doesn't pin
+        // unused symbols; state is only kept alive so the device
+        // outlives the instance's destructor ordering.
+        let _ = state;
+
+        match result {
+            vk::Result::SUCCESS => VulkanQueryResult::Supported,
+            vk::Result::ERROR_FORMAT_NOT_SUPPORTED => VulkanQueryResult::NotSupported,
+            other => {
+                if verbose {
+                    eprintln!(
+                        "vk_query {} mod=0x{:x} chromium_like={}: {:?}",
+                        format.name, modifier, chromium_like, other
+                    );
+                }
+                VulkanQueryResult::Error(format!("{:?}", other))
+            }
+        }
     }
 
     /// Like `try_import_explicit` / `try_import_list` but with the

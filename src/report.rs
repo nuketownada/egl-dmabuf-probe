@@ -7,7 +7,7 @@ use tabled::{
 };
 
 use crate::probe::{AllocResult, ImportResult, MatrixCell, ModifierSpec, FormatSpec, Probe};
-use crate::vulkan_import::{VulkanImportResult, VulkanProbe};
+use crate::vulkan_import::{VulkanImportResult, VulkanProbe, VulkanQueryResult};
 
 /// Keys we highlight in the EGL extension dumps.
 const RELEVANT_EXTENSIONS: &[(&str, &str)] = &[
@@ -195,6 +195,11 @@ struct Row {
     /// Vulkan (chromium-like profile) — list-modifier path.
     #[tabled(rename = "VK chromium\n(list)")]
     vulkan_chromium_list: String,
+    /// vkGetPhysicalDeviceImageFormatProperties2 result — the *query*
+    /// chromium does BEFORE attempting vkCreateImage. Shown as
+    /// `simple/chromium` for the two profiles.
+    #[tabled(rename = "VK query\n(s/c)")]
+    vulkan_query: String,
     #[tabled(rename = "Notes")]
     notes: String,
 }
@@ -237,6 +242,11 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 None => "—".dimmed().to_string(),
                 Some(v) => fmt_vk_import(v),
             };
+            let vulkan_query = format!(
+                "{}/{}",
+                fmt_vk_query(&c.vulkan_query_simple),
+                fmt_vk_query(&c.vulkan_query_chromium)
+            );
             // Notes priority: alloc failure → chromium-like failure
             // (most relevant to the chromium bug) → simple Vulkan
             // failure → EGL failure.
@@ -264,6 +274,7 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
                 vulkan_list,
                 vulkan_chromium_explicit,
                 vulkan_chromium_list,
+                vulkan_query,
                 notes,
             }
         })
@@ -272,7 +283,7 @@ pub fn print_matrix(cells: &[MatrixCell], formats: &[FormatSpec], modifiers: &[M
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Modify::new(Columns::single(9)).with(Width::wrap(50).keep_words(true)));
+        .with(Modify::new(Columns::single(10)).with(Width::wrap(50).keep_words(true)));
     println!("\n{}", "DMA-BUF format × modifier matrix".bold().underline());
     println!("{table}");
     println!(
@@ -295,6 +306,16 @@ fn fmt_vk_import(r: &VulkanImportResult) -> String {
         VulkanImportResult::Ok => "ok".green().to_string(),
         VulkanImportResult::Failed(_) => "fail".red().to_string(),
         VulkanImportResult::Skipped(_) => "skip".dimmed().to_string(),
+    }
+}
+
+fn fmt_vk_query(r: &Option<VulkanQueryResult>) -> String {
+    match r {
+        None => "—".dimmed().to_string(),
+        Some(VulkanQueryResult::Supported) => "ok".green().to_string(),
+        Some(VulkanQueryResult::NotSupported) => "n/a".yellow().to_string(),
+        Some(VulkanQueryResult::Error(_)) => "err".red().to_string(),
+        Some(VulkanQueryResult::Skipped(_)) => "skip".dimmed().to_string(),
     }
 }
 
