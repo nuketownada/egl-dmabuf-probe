@@ -109,10 +109,16 @@ egl-dmabuf-probe -d /dev/dri/renderD129 --layout-sizes 2560x16,2560x40,1920x1080
 Add `--readback N` to also allocate N buffers per size. Each buffer is
 imported as a two-plane image through both paths, a pattern is written
 to both planes with `vkCmdCopyBufferToImage`, and the result is copied
-back and compared. Imports run one at a time; the GBM buffers all stay
-allocated. On 615.78.08 (RTX 4000 Ada) the explicit path reads back
-about 80% of the chroma as zeros at 2560x40–64, while the list path
-reads back correctly.
+back and compared. By default imports run one at a time while the GBM
+buffers all stay allocated; `--concurrent` imports every buffer first
+and keeps all the imports alive for the whole pass.
+
+On 615.78.08 (RTX 4000 Ada):
+- At 2560x40–64 the explicit path reads back about 80% of the chroma as
+  zeros, even with a single buffer. The list path reads back correctly.
+- With `--readback 40 --concurrent`, both paths lose some buffers'
+  planes at 1920x1080 (every 32nd import) and 2560x1440 (every 16th).
+  Run sequentially, the same sizes read back correctly.
 
 ## Building
 

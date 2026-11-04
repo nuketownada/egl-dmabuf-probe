@@ -119,7 +119,13 @@ impl Probe {
     /// list Vulkan paths report for it. Flags explicit-path memory
     /// requirements that can't cover GBM's last plane — the symptom
     /// in NVIDIA forum thread 387942.
-    pub fn run_layout_test(&self, vulkan: &VulkanProbe, sizes: &[(u32, u32)], readback: u32) {
+    pub fn run_layout_test(
+        &self,
+        vulkan: &VulkanProbe,
+        sizes: &[(u32, u32)],
+        readback: u32,
+        concurrent: bool,
+    ) {
         let nv12 = FormatSpec { name: "NV12", fourcc: DrmFourcc::Nv12 };
         for &(w, h) in sizes {
             println!("== NV12 {w}x{h}");
@@ -182,16 +188,19 @@ impl Probe {
                 }
             }
             if readback > 0 {
-                self.run_readback(vulkan, w, h, readback);
+                self.run_readback(vulkan, w, h, readback, concurrent);
             }
         }
     }
 
-    /// Allocate `count` NV12 bos at once (they stay alive together, as
-    /// in the 387942 reproducer, where failures depended on how many
-    /// imports existed), then round-trip a pattern through each via
-    /// both import paths. Prints only buffers that read back wrong.
-    fn run_readback(&self, vulkan: &VulkanProbe, w: u32, h: u32, count: u32) {
+    /// Allocate `count` NV12 bos at once, then round-trip a pattern
+    /// through each via both import paths. With `concurrent`, every bo
+    /// is imported before the first round-trip and all imports stay
+    /// alive together, as in the 387942 reproducer (whose failures
+    /// depended on how many imports existed); otherwise each import is
+    /// created and destroyed around its own round-trip. Prints only
+    /// buffers that read back wrong.
+    fn run_readback(&self, vulkan: &VulkanProbe, w: u32, h: u32, count: u32, concurrent: bool) {
         let bos: Vec<_> = (0..count)
             .filter_map(|_| {
                 self.gbm
@@ -202,8 +211,18 @@ impl Probe {
         for explicit in [true, false] {
             let label = if explicit { "explicit" } else { "list    " };
             let mut bad = 0;
-            for (i, bo) in bos.iter().enumerate() {
-                match vulkan.readback_test(bo, w, h, explicit) {
+            let imports: Vec<_> = if concurrent {
+                bos.iter().map(|bo| Some(vulkan.import_two_plane(bo, w, h, explicit))).collect()
+            } else {
+                bos.iter().map(|_| None).collect()
+            };
+            for (i, (bo, import)) in bos.iter().zip(&imports).enumerate() {
+                let result = match import {
+                    Some(Ok(img)) => vulkan.roundtrip(img, w, h),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => vulkan.readback_test(bo, w, h, explicit),
+                };
+                match result {
                     Err(e) => {
                         bad += 1;
                         println!("   readback {label} #{i}: {e}");

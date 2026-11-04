@@ -60,6 +60,11 @@ struct Args {
     /// mismatches.
     #[arg(long, value_name = "N")]
     readback: Option<u32>,
+
+    /// With --readback: import all N buffers before testing any, and
+    /// keep every import alive until the pass is done.
+    #[arg(long)]
+    concurrent: bool,
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
@@ -111,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(sizes) = &args.layout_sizes {
         let vp = vulkan_probe.as_ref().ok_or("--layout-sizes needs the Vulkan probe")?;
-        probe.run_layout_test(vp, sizes, args.readback.unwrap_or(0));
+        probe.run_layout_test(vp, sizes, args.readback.unwrap_or(0), args.concurrent);
         return Ok(());
     }
 

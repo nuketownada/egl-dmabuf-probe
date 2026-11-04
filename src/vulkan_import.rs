@@ -740,6 +740,20 @@ impl VulkanProbe {
         height: u32,
         explicit: bool,
     ) -> Result<[f64; 2], String> {
+        let img = self.import_two_plane(bo, width, height, explicit)?;
+        self.roundtrip(&img, width, height)
+    }
+
+    /// Import `bo` as a `G8_B8R8_2PLANE_420_UNORM` image with
+    /// TRANSFER_SRC/DST usage, bound to the whole dma-buf. The import
+    /// lives until the returned value is dropped.
+    pub fn import_two_plane<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        width: u32,
+        height: u32,
+        explicit: bool,
+    ) -> Result<Imported<'_>, String> {
         let state = self.state.as_ref().ok_or_else(|| {
             format!("missing device extensions: {}", self.missing_extensions.join(", "))
         })?;
@@ -784,15 +798,8 @@ impl VulkanProbe {
             image_ci.push_next(&mut list_info)
         };
 
-        // Everything created below is torn down by `Cleanup` on any
-        // return path.
-        let mut c = Cleanup {
-            dev,
-            image: vk::Image::null(),
-            image_memory: vk::DeviceMemory::null(),
-            buffers: Vec::new(),
-            pool: vk::CommandPool::null(),
-        };
+        // `Imported`'s Drop frees whatever was created on any return path.
+        let mut c = Imported { dev, image: vk::Image::null(), memory: vk::DeviceMemory::null() };
         c.image = unsafe { dev.create_image(&image_ci, None) }
             .map_err(|e| format!("vkCreateImage: {e:?}"))?;
 
@@ -824,15 +831,26 @@ impl VulkanProbe {
             .memory_type_index(usable.trailing_zeros())
             .push_next(&mut import_info)
             .push_next(&mut dedicated);
-        c.image_memory = match unsafe { dev.allocate_memory(&alloc_info, None) } {
+        c.memory = match unsafe { dev.allocate_memory(&alloc_info, None) } {
             Ok(m) => m,
             Err(e) => {
                 unsafe { libc::close(fd) };
                 return Err(format!("vkAllocateMemory(import): {e:?}"));
             }
         };
-        unsafe { dev.bind_image_memory(c.image, c.image_memory, 0) }
+        unsafe { dev.bind_image_memory(c.image, c.memory, 0) }
             .map_err(|e| format!("vkBindImageMemory: {e:?}"))?;
+        Ok(c)
+    }
+
+    /// Write a pattern into both planes of `img`, copy it back out and
+    /// return the fraction of mismatched bytes per plane (Y, CbCr).
+    pub fn roundtrip(&self, img: &Imported, width: u32, height: u32) -> Result<[f64; 2], String> {
+        let state = self.state.as_ref().ok_or("no Vulkan device")?;
+        let dev = &state.device;
+        // Staging buffers and the command pool are torn down by
+        // `Cleanup` on any return path.
+        let mut c = Cleanup { dev, buffers: Vec::new(), pool: vk::CommandPool::null() };
 
         // Tightly packed staging layout: Y (w×h R8), then CbCr
         // (w/2×h/2 R8G8 = w×h/2 bytes).
@@ -907,7 +925,7 @@ impl VulkanProbe {
                 .dst_access_mask(dst)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(c.image)
+                .image(img.image)
                 .subresource_range(range)
         };
         unsafe {
@@ -930,7 +948,7 @@ impl VulkanProbe {
             dev.cmd_copy_buffer_to_image(
                 cmd,
                 upload,
-                c.image,
+                img.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
             );
@@ -950,7 +968,7 @@ impl VulkanProbe {
             );
             dev.cmd_copy_image_to_buffer(
                 cmd,
-                c.image,
+                img.image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 download,
                 &regions,
@@ -1031,11 +1049,29 @@ impl VulkanProbe {
     }
 }
 
-/// Destroys whatever `readback_test` managed to create.
-struct Cleanup<'a> {
+/// A two-plane image imported from a dma-buf, with its memory.
+pub struct Imported<'a> {
     dev: &'a ash::Device,
     image: vk::Image,
-    image_memory: vk::DeviceMemory,
+    memory: vk::DeviceMemory,
+}
+
+impl Drop for Imported<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.image != vk::Image::null() {
+                self.dev.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                self.dev.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
+/// Destroys whatever `roundtrip` managed to create.
+struct Cleanup<'a> {
+    dev: &'a ash::Device,
     buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
     pool: vk::CommandPool,
 }
@@ -1050,12 +1086,6 @@ impl Drop for Cleanup<'_> {
             for &(b, m) in &self.buffers {
                 dev.destroy_buffer(b, None);
                 dev.free_memory(m, None);
-            }
-            if self.image != vk::Image::null() {
-                dev.destroy_image(self.image, None);
-            }
-            if self.image_memory != vk::DeviceMemory::null() {
-                dev.free_memory(self.image_memory, None);
             }
         }
     }
