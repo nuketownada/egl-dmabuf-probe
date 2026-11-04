@@ -114,6 +114,76 @@ impl Probe {
 
     /// Call `eglQueryDmaBufFormatsEXT` to enumerate the formats the
     /// driver claims to accept for dma-buf import.
+    /// For each size: allocate one NV12 bo (driver-chosen modifier),
+    /// then print GBM's plane layout next to what the explicit and
+    /// list Vulkan paths report for it. Flags explicit-path memory
+    /// requirements that can't cover GBM's last plane — the symptom
+    /// in NVIDIA forum thread 387942.
+    pub fn run_layout_test(&self, vulkan: &VulkanProbe, sizes: &[(u32, u32)]) {
+        let nv12 = FormatSpec { name: "NV12", fourcc: DrmFourcc::Nv12 };
+        for &(w, h) in sizes {
+            println!("== NV12 {w}x{h}");
+            let bo = match self.gbm.create_buffer_object::<()>(
+                w,
+                h,
+                GbmFormat::Nv12,
+                BufferObjectFlags::RENDERING,
+            ) {
+                Ok(bo) => bo,
+                Err(e) => {
+                    println!("   gbm alloc failed: {e}");
+                    continue;
+                }
+            };
+            let dmabuf_size = bo
+                .fd_for_plane(0)
+                .map(|fd| {
+                    let raw = fd.into_raw_fd();
+                    let size = unsafe { libc::lseek(raw, 0, libc::SEEK_END) };
+                    unsafe { libc::close(raw) };
+                    size
+                })
+                .unwrap_or(-1);
+            let planes = bo.plane_count();
+            print!("   gbm      mod=0x{:016x} dmabuf={dmabuf_size}", u64::from(bo.modifier()));
+            for i in 0..planes {
+                print!(
+                    "  p{i} off={} pitch={}",
+                    bo.offset(i as i32),
+                    bo.stride_for_plane(i as i32)
+                );
+            }
+            println!();
+            // CbCr plane: half height, full-width pitch.
+            let last = planes as i32 - 1;
+            let needed = bo.offset(last) as u64
+                + bo.stride_for_plane(last) as u64 * (h as u64).div_ceil(2);
+
+            for explicit in [true, false] {
+                let label = if explicit { "explicit" } else { "list    " };
+                match vulkan.layout_report(&bo, &nv12, w, h, explicit) {
+                    Err(e) => println!("   {label} {e}"),
+                    Ok(r) => {
+                        print!("   {label} memreq={}", r.mem_size);
+                        if let Some(m) = r.chosen_modifier {
+                            print!(" mod=0x{m:016x}");
+                        }
+                        for (i, p) in r.planes.iter().enumerate() {
+                            print!(
+                                "  p{i} off={} size={} pitch={}",
+                                p.offset, p.size, p.row_pitch
+                            );
+                        }
+                        if r.mem_size < needed {
+                            print!("  ** memreq < gbm CbCr end ({needed})");
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+    }
+
     pub fn query_supported_formats(&self) -> Result<Vec<EGLint>, String> {
         let f = self
             .egl

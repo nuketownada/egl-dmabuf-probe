@@ -47,6 +47,20 @@ struct Args {
     /// unavailable or the GPU has no Vulkan support).
     #[arg(long)]
     skip_vulkan: bool,
+
+    /// Instead of the matrix, allocate NV12 at each comma-separated
+    /// WxH size and compare GBM's plane layout with the explicit and
+    /// list Vulkan paths' memory requirements and subresource layouts.
+    #[arg(long, value_delimiter = ',', value_parser = parse_size)]
+    layout_sizes: Option<Vec<(u32, u32)>>,
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or_else(|| format!("expected WxH, got {s}"))?;
+    Ok((
+        w.parse().map_err(|e| format!("{s}: {e}"))?,
+        h.parse().map_err(|e| format!("{s}: {e}"))?,
+    ))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -86,6 +100,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report::print_driver_claims(&probe);
     if let Some(vp) = &vulkan_probe {
         report::print_vulkan_info(vp);
+    }
+
+    if let Some(sizes) = &args.layout_sizes {
+        let vp = vulkan_probe.as_ref().ok_or("--layout-sizes needs the Vulkan probe")?;
+        probe.run_layout_test(vp, sizes);
+        return Ok(());
     }
 
     if args.extensions_only {

@@ -632,6 +632,106 @@ impl VulkanProbe {
     }
 }
 
+impl VulkanProbe {
+    /// Create (but don't bind) an image for `bo` via the explicit or
+    /// list path and report what the driver thinks the image looks
+    /// like: `vkGetImageMemoryRequirements` size, the modifier it
+    /// settled on, and `vkGetImageSubresourceLayout` per memory plane.
+    /// Lets the explicit path's idea of the layout be compared with
+    /// GBM's and with the list path's.
+    pub fn layout_report<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        format: &FormatSpec,
+        width: u32,
+        height: u32,
+        explicit: bool,
+    ) -> Result<LayoutReport, String> {
+        let state = self.state.as_ref().ok_or_else(|| {
+            format!("missing device extensions: {}", self.missing_extensions.join(", "))
+        })?;
+        let vk_format = drm_to_vk_format(format.fourcc)
+            .ok_or_else(|| format!("no Vulkan format for {:?}", format.fourcc))?;
+
+        let plane_count = bo.plane_count();
+        let modifier: u64 = u64::from(bo.modifier());
+        let plane_layouts: Vec<vk::SubresourceLayout> = (0..plane_count)
+            .map(|i| vk::SubresourceLayout {
+                offset: bo.offset(i as i32) as u64,
+                size: 0,
+                row_pitch: bo.stride_for_plane(i as i32) as u64,
+                array_pitch: 0,
+                depth_pitch: 0,
+            })
+            .collect();
+
+        let mut ext_mem_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut explicit_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+        let modifier_list = [modifier];
+        let mut list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+            .drm_format_modifiers(&modifier_list);
+
+        let mut image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut ext_mem_info);
+        image_ci = if explicit {
+            image_ci.push_next(&mut explicit_info)
+        } else {
+            image_ci.push_next(&mut list_info)
+        };
+
+        let image = unsafe { state.device.create_image(&image_ci, None) }
+            .map_err(|e| format!("vkCreateImage: {e:?}"))?;
+
+        let mem_size = unsafe { state.device.get_image_memory_requirements(image) }.size;
+
+        let drm_mod = ash::ext::image_drm_format_modifier::Device::new(&self.instance, &state.device);
+        let mut mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
+        let chosen_modifier = unsafe {
+            drm_mod.get_image_drm_format_modifier_properties(image, &mut mod_props)
+        }
+        .ok()
+        .map(|_| mod_props.drm_format_modifier);
+
+        const PLANE_ASPECTS: [vk::ImageAspectFlags; 4] = [
+            vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+            vk::ImageAspectFlags::MEMORY_PLANE_1_EXT,
+            vk::ImageAspectFlags::MEMORY_PLANE_2_EXT,
+            vk::ImageAspectFlags::MEMORY_PLANE_3_EXT,
+        ];
+        let planes = PLANE_ASPECTS[..plane_count as usize]
+            .iter()
+            .map(|&aspect| unsafe {
+                state.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource { aspect_mask: aspect, mip_level: 0, array_layer: 0 },
+                )
+            })
+            .collect();
+
+        unsafe { state.device.destroy_image(image, None) };
+        Ok(LayoutReport { mem_size, chosen_modifier, planes })
+    }
+}
+
+pub struct LayoutReport {
+    pub mem_size: u64,
+    pub chosen_modifier: Option<u64>,
+    pub planes: Vec<vk::SubresourceLayout>,
+}
+
 impl Drop for VulkanProbe {
     fn drop(&mut self) {
         unsafe {

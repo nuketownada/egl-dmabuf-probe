@@ -87,8 +87,12 @@
           shellHook = ''
             export LD_LIBRARY_PATH="${pkgs.libglvnd}/lib:${pkgs.vulkan-loader}/lib:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             # Tell vulkan-loader where to find vendor ICDs. NixOS exposes
-            # the active driver's ICD manifest in /run/opengl-driver.
-            export VK_ICD_FILENAMES="/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.x86_64.json"
+            # the active driver's ICD manifest in /run/opengl-driver; its
+            # name varies by driver packaging (nvidia_icd.json on 595.x,
+            # nvidia_icd.x86_64.json on older builds).
+            for icd in /run/opengl-driver/share/vulkan/icd.d/nvidia_icd{.x86_64,}.json; do
+              [ -e "$icd" ] && export VK_ICD_FILENAMES="$icd" && break
+            done
             echo "egl-dmabuf-probe dev shell."
             echo "  LD_LIBRARY_PATH includes libglvnd + vulkan-loader + /run/opengl-driver/lib"
             echo "  VK_ICD_FILENAMES points at NVIDIA's ICD manifest"

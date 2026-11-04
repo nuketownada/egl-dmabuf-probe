@@ -94,6 +94,18 @@ egl-dmabuf-probe -v                            # verbose: dump all per-attempt E
 egl-dmabuf-probe --format-only NV12,P010       # only test specific formats
 ```
 
+`--layout-sizes` skips the matrix. At each size it allocates one NV12
+buffer through GBM and prints GBM's plane offsets and pitches alongside
+what each Vulkan path reports for the same buffer: the memory
+requirement, the modifier, and the per-plane layout. It flags an
+explicit-path memory requirement that doesn't reach the end of GBM's
+CbCr plane (see NVIDIA forum thread
+[387942](https://forums.developer.nvidia.com/t/vulkan-some-nv12-dma-bufs-imported-as-two-plane-images-read-back-wrong-615-78-08/387942)).
+
+```bash
+egl-dmabuf-probe -d /dev/dri/renderD129 --layout-sizes 2560x16,2560x40,1920x1080
+```
+
 ## Building
 
 With Nix:
