@@ -106,6 +106,14 @@ CbCr plane (see NVIDIA forum thread
 egl-dmabuf-probe -d /dev/dri/renderD129 --layout-sizes 2560x16,2560x40,1920x1080
 ```
 
+Add `--readback N` to also allocate N buffers per size. Each buffer is
+imported as a two-plane image through both paths, a pattern is written
+to both planes with `vkCmdCopyBufferToImage`, and the result is copied
+back and compared. Imports run one at a time; the GBM buffers all stay
+allocated. On 615.78.08 (RTX 4000 Ada) the explicit path reads back
+about 80% of the chroma as zeros at 2560x40–64, while the list path
+reads back correctly.
+
 ## Building
 
 With Nix:

@@ -119,7 +119,7 @@ impl Probe {
     /// list Vulkan paths report for it. Flags explicit-path memory
     /// requirements that can't cover GBM's last plane — the symptom
     /// in NVIDIA forum thread 387942.
-    pub fn run_layout_test(&self, vulkan: &VulkanProbe, sizes: &[(u32, u32)]) {
+    pub fn run_layout_test(&self, vulkan: &VulkanProbe, sizes: &[(u32, u32)], readback: u32) {
         let nv12 = FormatSpec { name: "NV12", fourcc: DrmFourcc::Nv12 };
         for &(w, h) in sizes {
             println!("== NV12 {w}x{h}");
@@ -181,6 +181,45 @@ impl Probe {
                     }
                 }
             }
+            if readback > 0 {
+                self.run_readback(vulkan, w, h, readback);
+            }
+        }
+    }
+
+    /// Allocate `count` NV12 bos at once (they stay alive together, as
+    /// in the 387942 reproducer, where failures depended on how many
+    /// imports existed), then round-trip a pattern through each via
+    /// both import paths. Prints only buffers that read back wrong.
+    fn run_readback(&self, vulkan: &VulkanProbe, w: u32, h: u32, count: u32) {
+        let bos: Vec<_> = (0..count)
+            .filter_map(|_| {
+                self.gbm
+                    .create_buffer_object::<()>(w, h, GbmFormat::Nv12, BufferObjectFlags::RENDERING)
+                    .ok()
+            })
+            .collect();
+        for explicit in [true, false] {
+            let label = if explicit { "explicit" } else { "list    " };
+            let mut bad = 0;
+            for (i, bo) in bos.iter().enumerate() {
+                match vulkan.readback_test(bo, w, h, explicit) {
+                    Err(e) => {
+                        bad += 1;
+                        println!("   readback {label} #{i}: {e}");
+                    }
+                    Ok([y, c]) if y > 0.0 || c > 0.0 => {
+                        bad += 1;
+                        println!(
+                            "   readback {label} #{i}: Y {:.1}% wrong, CbCr {:.1}% wrong",
+                            y * 100.0,
+                            c * 100.0
+                        );
+                    }
+                    Ok(_) => {}
+                }
+            }
+            println!("   readback {label} {}/{} buffers correct", bos.len() - bad, bos.len());
         }
     }
 

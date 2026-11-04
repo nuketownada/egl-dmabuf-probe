@@ -31,6 +31,8 @@ pub struct VulkanProbe {
 struct ImportState {
     device: ash::Device,
     external_memory_fd: ash::khr::external_memory_fd::Device,
+    queue_family: u32,
+    queue: vk::Queue,
 }
 
 #[derive(Debug)]
@@ -209,7 +211,8 @@ impl VulkanProbe {
                 Ok(device) => {
                     let external_memory_fd =
                         ash::khr::external_memory_fd::Device::new(&instance, &device);
-                    Some(ImportState { device, external_memory_fd })
+                    let queue = unsafe { device.get_device_queue(queue_family, 0) };
+                    Some(ImportState { device, external_memory_fd, queue_family, queue })
                 }
                 Err(e) => {
                     eprintln!(
@@ -723,6 +726,338 @@ impl VulkanProbe {
 
         unsafe { state.device.destroy_image(image, None) };
         Ok(LayoutReport { mem_size, chosen_modifier, planes })
+    }
+
+    /// Import `bo` as a two-plane image (explicit or list path), bound
+    /// to the full dma-buf, write a pattern into both planes with
+    /// vkCmdCopyBufferToImage, copy it back out and compare. Mirrors
+    /// the reproducer in NVIDIA forum thread 387942. Returns the
+    /// fraction of mismatched bytes per plane (Y, CbCr).
+    pub fn readback_test<U>(
+        &self,
+        bo: &gbm::BufferObject<U>,
+        width: u32,
+        height: u32,
+        explicit: bool,
+    ) -> Result<[f64; 2], String> {
+        let state = self.state.as_ref().ok_or_else(|| {
+            format!("missing device extensions: {}", self.missing_extensions.join(", "))
+        })?;
+        let dev = &state.device;
+        if bo.plane_count() != 2 {
+            return Err(format!("expected 2 planes, bo has {}", bo.plane_count()));
+        }
+        let modifier: u64 = u64::from(bo.modifier());
+        let plane_layouts: Vec<vk::SubresourceLayout> = (0..2)
+            .map(|i| vk::SubresourceLayout {
+                offset: bo.offset(i) as u64,
+                size: 0,
+                row_pitch: bo.stride_for_plane(i) as u64,
+                array_pitch: 0,
+                depth_pitch: 0,
+            })
+            .collect();
+
+        let mut ext_mem_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut explicit_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+        let modifier_list = [modifier];
+        let mut list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+            .drm_format_modifiers(&modifier_list);
+        let mut image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::G8_B8R8_2PLANE_420_UNORM)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut ext_mem_info);
+        image_ci = if explicit {
+            image_ci.push_next(&mut explicit_info)
+        } else {
+            image_ci.push_next(&mut list_info)
+        };
+
+        // Everything created below is torn down by `Cleanup` on any
+        // return path.
+        let mut c = Cleanup {
+            dev,
+            image: vk::Image::null(),
+            image_memory: vk::DeviceMemory::null(),
+            buffers: Vec::new(),
+            pool: vk::CommandPool::null(),
+        };
+        c.image = unsafe { dev.create_image(&image_ci, None) }
+            .map_err(|e| format!("vkCreateImage: {e:?}"))?;
+
+        let fd = bo.fd_for_plane(0).map_err(|e| format!("gbm_bo_get_fd: {e}"))?.into_raw_fd();
+        let dmabuf_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) } as u64;
+        let mem_reqs = unsafe { dev.get_image_memory_requirements(c.image) };
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        let usable = unsafe {
+            state.external_memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd,
+                &mut fd_props,
+            )
+        }
+        .map(|_| mem_reqs.memory_type_bits & fd_props.memory_type_bits)
+        .unwrap_or(0);
+        if usable == 0 {
+            unsafe { libc::close(fd) };
+            return Err("no usable memory type for the dma-buf".into());
+        }
+        // Bind the whole dma-buf, as the 387942 reproducer does, so an
+        // undersized memreq can't be what truncates the CbCr plane.
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(c.image);
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(fd);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(dmabuf_size.max(mem_reqs.size))
+            .memory_type_index(usable.trailing_zeros())
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated);
+        c.image_memory = match unsafe { dev.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { libc::close(fd) };
+                return Err(format!("vkAllocateMemory(import): {e:?}"));
+            }
+        };
+        unsafe { dev.bind_image_memory(c.image, c.image_memory, 0) }
+            .map_err(|e| format!("vkBindImageMemory: {e:?}"))?;
+
+        // Tightly packed staging layout: Y (w×h R8), then CbCr
+        // (w/2×h/2 R8G8 = w×h/2 bytes).
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        let y_bytes = (width * height) as u64;
+        let c_bytes = (cw * ch * 2) as u64;
+        let total = y_bytes + c_bytes;
+        let pattern: Vec<u8> = (0..total)
+            .map(|i| {
+                let i = i as u32;
+                (i.wrapping_mul(2654435761) >> 24) as u8 ^ (i / width) as u8
+            })
+            .collect();
+
+        let (upload, upload_mem) = self.host_buffer(dev, total)?;
+        c.buffers.push((upload, upload_mem));
+        let (download, download_mem) = self.host_buffer(dev, total)?;
+        c.buffers.push((download, download_mem));
+        unsafe {
+            let p = dev
+                .map_memory(upload_mem, 0, total, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("vkMapMemory: {e:?}"))?;
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), p as *mut u8, total as usize);
+            dev.unmap_memory(upload_mem);
+        }
+
+        let regions = [
+            (vk::ImageAspectFlags::PLANE_0, 0, width, height),
+            (vk::ImageAspectFlags::PLANE_1, y_bytes, cw, ch),
+        ]
+        .map(|(aspect, offset, w, h)| {
+            vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: aspect,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 })
+        });
+
+        c.pool = unsafe {
+            dev.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(state.queue_family),
+                None,
+            )
+        }
+        .map_err(|e| format!("vkCreateCommandPool: {e:?}"))?;
+        let cmd = unsafe {
+            dev.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(c.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| format!("vkAllocateCommandBuffers: {e:?}"))?[0];
+
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let barrier = |old, new, src, dst| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(old)
+                .new_layout(new)
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(c.image)
+                .subresource_range(range)
+        };
+        unsafe {
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                .map_err(|e| format!("vkBeginCommandBuffer: {e:?}"))?;
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )],
+            );
+            dev.cmd_copy_buffer_to_image(
+                cmd,
+                upload,
+                c.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                )],
+            );
+            dev.cmd_copy_image_to_buffer(
+                cmd,
+                c.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                download,
+                &regions,
+            );
+            dev.end_command_buffer(cmd)
+                .map_err(|e| format!("vkEndCommandBuffer: {e:?}"))?;
+            let cmds = [cmd];
+            dev.queue_submit(
+                state.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                vk::Fence::null(),
+            )
+            .map_err(|e| format!("vkQueueSubmit: {e:?}"))?;
+            dev.queue_wait_idle(state.queue)
+                .map_err(|e| format!("vkQueueWaitIdle: {e:?}"))?;
+        }
+
+        let readback = unsafe {
+            let p = dev
+                .map_memory(download_mem, 0, total, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("vkMapMemory: {e:?}"))?;
+            let v = std::slice::from_raw_parts(p as *const u8, total as usize).to_vec();
+            dev.unmap_memory(download_mem);
+            v
+        };
+        let wrong = |r: std::ops::Range<usize>| {
+            let n = r.len();
+            r.filter(|&i| readback[i] != pattern[i]).count() as f64 / n as f64
+        };
+        let y = y_bytes as usize;
+        Ok([wrong(0..y), wrong(y..total as usize)])
+    }
+
+    fn host_buffer(&self, dev: &ash::Device, size: u64) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
+        let buffer = unsafe {
+            dev.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+                None,
+            )
+        }
+        .map_err(|e| format!("vkCreateBuffer: {e:?}"))?;
+        let reqs = unsafe { dev.get_buffer_memory_requirements(buffer) };
+        let props = unsafe {
+            self.instance.get_physical_device_memory_properties(self.physical_device_handle)
+        };
+        let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(type_index) = (0..props.memory_type_count).find(|&i| {
+            reqs.memory_type_bits & (1 << i) != 0
+                && props.memory_types[i as usize].property_flags.contains(want)
+        }) else {
+            unsafe { dev.destroy_buffer(buffer, None) };
+            return Err("no host-visible memory type".into());
+        };
+        let memory = match unsafe {
+            dev.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(type_index),
+                None,
+            )
+        } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe { dev.destroy_buffer(buffer, None) };
+                return Err(format!("vkAllocateMemory(host): {e:?}"));
+            }
+        };
+        if let Err(e) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                dev.free_memory(memory, None);
+                dev.destroy_buffer(buffer, None);
+            }
+            return Err(format!("vkBindBufferMemory: {e:?}"));
+        }
+        Ok((buffer, memory))
+    }
+}
+
+/// Destroys whatever `readback_test` managed to create.
+struct Cleanup<'a> {
+    dev: &'a ash::Device,
+    image: vk::Image,
+    image_memory: vk::DeviceMemory,
+    buffers: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    pool: vk::CommandPool,
+}
+
+impl Drop for Cleanup<'_> {
+    fn drop(&mut self) {
+        let dev = self.dev;
+        unsafe {
+            if self.pool != vk::CommandPool::null() {
+                dev.destroy_command_pool(self.pool, None);
+            }
+            for &(b, m) in &self.buffers {
+                dev.destroy_buffer(b, None);
+                dev.free_memory(m, None);
+            }
+            if self.image != vk::Image::null() {
+                dev.destroy_image(self.image, None);
+            }
+            if self.image_memory != vk::DeviceMemory::null() {
+                dev.free_memory(self.image_memory, None);
+            }
+        }
     }
 }
 

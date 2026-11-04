@@ -53,6 +53,13 @@ struct Args {
     /// list Vulkan paths' memory requirements and subresource layouts.
     #[arg(long, value_delimiter = ',', value_parser = parse_size)]
     layout_sizes: Option<Vec<(u32, u32)>>,
+
+    /// With --layout-sizes: also allocate N NV12 buffers per size (all
+    /// kept alive), import each as a two-plane image via the explicit
+    /// and list paths, write a pattern, read it back and report
+    /// mismatches.
+    #[arg(long, value_name = "N")]
+    readback: Option<u32>,
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
@@ -104,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(sizes) = &args.layout_sizes {
         let vp = vulkan_probe.as_ref().ok_or("--layout-sizes needs the Vulkan probe")?;
-        probe.run_layout_test(vp, sizes);
+        probe.run_layout_test(vp, sizes, args.readback.unwrap_or(0));
         return Ok(());
     }
 
